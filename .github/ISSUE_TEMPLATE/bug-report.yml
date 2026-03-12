@@ -1,0 +1,77 @@
+---
+name: Bug Report
+description: 报告技能使用中的问题
+title: "[Bug] 请简要描述问题"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请填写以下信息帮助我定位问题。
+  - type: input
+    id: platform
+    attributes:
+      label: 电商平台
+      description: 出现问题的平台（淘宝/京东/拼多多等）
+      placeholder: 例如：淘宝
+  - type: input
+    id: goods-id
+    attributes:
+      label: 商品 ID
+      description: 出现问题的商品 ID
+      placeholder: 例如：12345678
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 问题描述
+      description: 请详细描述发生了什么
+      placeholder: 例如：添加监控后提示"获取商品详情失败"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 错误日志
+      description: 如有错误信息，请粘贴
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: 技能版本
+      description: 运行 `uv run scripts/main.py --version` 查看
+      placeholder: 例如：1.0.0
+---
+
+name: Feature Request
+description: 提出新功能建议
+title: "[Feature] 请简要描述功能"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        欢迎提出建议！请填写以下信息。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 相关问题
+      description: 这个功能解决了什么问题？
+      placeholder: 例如：现在每次都要手动检查价格，希望能自动推送通知
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: 期望的解决方案
+      description: 你希望如何实现？
+      placeholder: 例如：希望支持微信推送，降价时自动发消息给我
+  - type: dropdown
+    id: priority
+    attributes:
+      label: 优先级
+      options:
+        - 低（有时间再做）
+        - 中（希望能有）
+        - 高（非常需要）
+    validations:
+      required: true
