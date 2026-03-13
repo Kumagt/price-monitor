@@ -89,6 +89,68 @@ def record_price(monitor_id, price_data):
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 
+async def search_goods(keyword, source, limit=10):
+    """搜索商品（调用买手 API 搜索接口）"""
+    global SESSION
+    
+    try:
+        resp = await SESSION.post(
+            "https://appapi.maishou88.com/api/v3/goods/search",
+            json={
+                "keyword": keyword,
+                "sourceType": str(source),
+                "inviteCode": INVITE_CODE,
+                "supplierCode": "",
+                "activityId": "",
+                "usageScene": 5,
+                "page": 1,
+                "pageSize": limit,
+            },
+            headers=HEADERS,
+        )
+        data = await resp.json(encoding="utf-8-sig") or {}
+        result = data.get("data") or {}
+        goods_list = result.get("goodsList", [])
+        
+        if not goods_list:
+            return []
+        
+        results = []
+        for goods in goods_list:
+            try:
+                goods_id = goods.get("goodsId") or goods.get("id")
+                if not goods_id:
+                    continue
+                
+                # 获取价格信息
+                actual_price = float(goods.get("actualPrice") or goods.get("price") or 0)
+                original_price = float(goods.get("originalPrice") or goods.get("marketPrice") or actual_price)
+                title = goods.get("title") or goods.get("goodsName") or "未知商品"
+                
+                # 尝试获取链接
+                app_url = goods.get("appUrl") or goods.get("clickUrl") or ""
+                if not app_url:
+                    # 如果需要链接，再调用一次 getTargetUrl
+                    pass
+                
+                results.append({
+                    "goods_id": goods_id,
+                    "title": title,
+                    "actualPrice": actual_price,
+                    "originalPrice": original_price,
+                    "appUrl": app_url,
+                    "couponPrice": float(goods.get("couponPrice") or 0),
+                })
+            except Exception as e:
+                print(f"解析商品数据失败：{e}")
+                continue
+        
+        return results
+    except Exception as e:
+        print(f"搜索失败：{e}")
+        return []
+
+
 async def get_goods_detail(goods_id, source):
     """获取商品详情（调用买手 API）"""
     global SESSION
@@ -341,6 +403,112 @@ async def show_history(args):
         print(f"{time_str:<20} ¥{record['price']:<9} {record.get('title', '')[:30]}")
 
 
+async def search_and_monitor(args):
+    """搜索商品并批量添加监控"""
+    keyword = args.keyword
+    source = int(args.source)
+    target_price = float(args.target_price) if args.target_price else None
+    limit = int(args.limit) if args.limit else 10
+    
+    source_names = {1: "淘宝", 2: "京东", 3: "拼多多", 7: "抖音", 8: "快手"}
+    source_name = source_names.get(source, f"平台{source}")
+    
+    print(f"🔍 正在搜索 \"{keyword}\"（{source_name}）...\n")
+    
+    # 搜索商品
+    results = await search_goods(keyword, source, limit)
+    
+    if not results:
+        print(f"❌ 未找到相关商品")
+        return
+    
+    print(f"✅ 找到 {len(results)} 个商品：\n")
+    print(f"{'序号':<4} {'名称':<30} {'当前价':<10} {'目标价':<10}")
+    print("-" * 70)
+    
+    for i, item in enumerate(results, 1):
+        name = item['title'][:28] + ".." if len(item['title']) > 30 else item['title']
+        target_str = f"¥{target_price}" if target_price else "-"
+        print(f"{i:<4} {name:<30} ¥{item['actualPrice']:<9} {target_str:<10}")
+    
+    # 交互式确认
+    print(f"\n是否批量添加监控？")
+    print(f"  [a] 添加全部 ({len(results)} 个)")
+    print(f"  [s] 选择性添加")
+    print(f"  [n] 取消")
+    
+    choice = input("\n请选择 (a/s/n): ").strip().lower()
+    
+    if choice == 'n':
+        print("已取消")
+        return
+    
+    monitors = load_monitors()
+    added_count = 0
+    
+    if choice == 'a':
+        # 添加全部
+        for item in results:
+            new_id = len(monitors) + 1
+            monitor = {
+                "id": new_id,
+                "goods_id": str(item['goods_id']),
+                "source": source,
+                "name": item['title'][:50],
+                "target_price": target_price,
+                "created_at": datetime.now().isoformat(),
+                "last_price": None,
+                "enabled": True,
+            }
+            monitors.append(monitor)
+            added_count += 1
+        
+        save_monitors(monitors)
+        print(f"\n✅ 已批量添加 {added_count} 个监控商品！")
+        
+    elif choice == 's':
+        # 选择性添加
+        print(f"\n请输入要添加的序号（用逗号分隔，如：1,3,5）：")
+        try:
+            indices = input("> ").strip()
+            if not indices:
+                print("未输入序号，已取消")
+                return
+            
+            selected = [int(x.strip()) - 1 for x in indices.split(",")]
+            selected = [i for i in selected if 0 <= i < len(results)]
+            
+            if not selected:
+                print("未选择有效序号，已取消")
+                return
+            
+            for idx in selected:
+                item = results[idx]
+                new_id = len(monitors) + 1
+                monitor = {
+                    "id": new_id,
+                    "goods_id": str(item['goods_id']),
+                    "source": source,
+                    "name": item['title'][:50],
+                    "target_price": target_price,
+                    "created_at": datetime.now().isoformat(),
+                    "last_price": None,
+                    "enabled": True,
+                }
+                monitors.append(monitor)
+                added_count += 1
+            
+            save_monitors(monitors)
+            print(f"\n✅ 已添加 {added_count} 个监控商品！")
+            
+        except Exception as e:
+            print(f"输入错误：{e}")
+            return
+    
+    print(f"\n使用 'uv run scripts/main.py list' 查看监控列表")
+    print(f"使用 'uv run scripts/main.py check --all' 检查价格")
+
+
 async def config_monitor(args):
     """配置监控参数"""
     config = load_config()
@@ -394,6 +562,14 @@ async def main():
         history_parser = parsers.add_parser("history", help="查看价格历史")
         history_parser.add_argument("--id", required=True, help="监控 ID")
         history_parser.set_defaults(func=show_history)
+        
+        # search 命令
+        search_parser = parsers.add_parser("search", help="搜索商品并批量添加监控")
+        search_parser.add_argument("--keyword", required=True, help="搜索关键词")
+        search_parser.add_argument("--source", required=True, help="平台 1:淘宝 2:京东 3:拼多多 7:抖音 8:快手")
+        search_parser.add_argument("--target_price", help="目标价格")
+        search_parser.add_argument("--limit", type=int, default=10, help="返回结果数量（默认 10）")
+        search_parser.set_defaults(func=search_and_monitor)
         
         # config 命令
         config_parser = parsers.add_parser("config", help="配置参数")
