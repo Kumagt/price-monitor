@@ -8,6 +8,7 @@ import json
 import yaml
 import asyncio
 import aiohttp
+import ssl
 import argparse
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,11 @@ HEADERS = {
     aiohttp.hdrs.REFERER: "https://hnbc018.kuaizhan.com/",
     aiohttp.hdrs.USER_AGENT: "Mozilla/5.0 AppleWebKit/537 Chrome/143 Safari/537",
 }
+
+# SSL 配置（跳过证书验证，用于测试）
+SSL_CONTEXT = ssl.create_default_context()
+SSL_CONTEXT.check_hostname = False
+SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 
 SESSION: aiohttp.ClientSession | None = None
 
@@ -94,8 +100,9 @@ async def search_goods(keyword, source, limit=10):
     global SESSION
     
     try:
+        # 尝试不同的 API 端点
         resp = await SESSION.post(
-            "https://appapi.maishou88.com/api/v3/goods/search",
+            "https://appapi.maishou88.com/api/v3/goods/list",
             json={
                 "keyword": keyword,
                 "sourceType": str(source),
@@ -109,8 +116,15 @@ async def search_goods(keyword, source, limit=10):
             headers=HEADERS,
         )
         data = await resp.json(encoding="utf-8-sig") or {}
-        result = data.get("data") or {}
-        goods_list = result.get("goodsList", [])
+        
+        # 尝试不同的数据结构
+        result = data.get("data") or data.get("result") or {}
+        goods_list = result.get("goodsList") or result.get("list") or result.get("items") or []
+        
+        if not goods_list:
+            # 如果列表为空，尝试直接返回 data
+            if isinstance(result, list):
+                goods_list = result
         
         if not goods_list:
             return []
@@ -118,20 +132,17 @@ async def search_goods(keyword, source, limit=10):
         results = []
         for goods in goods_list:
             try:
-                goods_id = goods.get("goodsId") or goods.get("id")
+                goods_id = goods.get("goodsId") or goods.get("id") or goods.get("goods_id")
                 if not goods_id:
                     continue
                 
                 # 获取价格信息
-                actual_price = float(goods.get("actualPrice") or goods.get("price") or 0)
-                original_price = float(goods.get("originalPrice") or goods.get("marketPrice") or actual_price)
-                title = goods.get("title") or goods.get("goodsName") or "未知商品"
+                actual_price = float(goods.get("actualPrice") or goods.get("price") or goods.get("actual_price") or 0)
+                original_price = float(goods.get("originalPrice") or goods.get("marketPrice") or goods.get("original_price") or actual_price)
+                title = goods.get("title") or goods.get("goodsName") or goods.get("name") or "未知商品"
                 
                 # 尝试获取链接
-                app_url = goods.get("appUrl") or goods.get("clickUrl") or ""
-                if not app_url:
-                    # 如果需要链接，再调用一次 getTargetUrl
-                    pass
+                app_url = goods.get("appUrl") or goods.get("clickUrl") or goods.get("url") or ""
                 
                 results.append({
                     "goods_id": goods_id,
@@ -139,7 +150,7 @@ async def search_goods(keyword, source, limit=10):
                     "actualPrice": actual_price,
                     "originalPrice": original_price,
                     "appUrl": app_url,
-                    "couponPrice": float(goods.get("couponPrice") or 0),
+                    "couponPrice": float(goods.get("couponPrice") or goods.get("coupon_price") or 0),
                 })
             except Exception as e:
                 print(f"解析商品数据失败：{e}")
@@ -531,7 +542,8 @@ async def config_monitor(args):
 
 async def main():
     global SESSION
-    async with aiohttp.ClientSession(headers=HEADERS) as SESSION:
+    connector = aiohttp.TCPConnector(ssl=SSL_CONTEXT)
+    async with aiohttp.ClientSession(headers=HEADERS, connector=connector) as SESSION:
         parser = argparse.ArgumentParser(description="电商价格监控工具")
         parsers = parser.add_subparsers()
         
