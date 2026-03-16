@@ -10,6 +10,7 @@ import asyncio
 import aiohttp
 import ssl
 import argparse
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -38,6 +39,42 @@ SSL_CONTEXT.check_hostname = False
 SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 
 SESSION: aiohttp.ClientSession | None = None
+
+
+def send_notification(title: str, message: str):
+    """发送通知到 OpenClaw（通过 sessions_send）"""
+    try:
+        # 尝试通过 OpenClaw 发送通知
+        # 这会在工作空间内创建一个通知文件，OpenClaw 可以读取
+        notification_file = Path.home() / ".openclaw" / "workspace" / "notifications" / "price-monitor.json"
+        notification_file.parent.mkdir(exist_ok=True)
+        
+        notification = {
+            "type": "price_alert",
+            "title": title,
+            "message": message,
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+        # 追加到通知列表
+        notifications = []
+        if notification_file.exists():
+            with open(notification_file, "r", encoding="utf-8") as f:
+                try:
+                    notifications = json.load(f)
+                except:
+                    notifications = []
+        
+        notifications.append(notification)
+        # 只保留最近 50 条
+        notifications = notifications[-50:]
+        
+        with open(notification_file, "w", encoding="utf-8") as f:
+            json.dump(notifications, f, ensure_ascii=False, indent=2)
+        
+        print(f"🔔 通知已记录：{title}")
+    except Exception as e:
+        print(f"⚠️ 发送通知失败：{e}")
 
 
 def load_monitors():
@@ -332,8 +369,19 @@ async def check_single_price(monitor_id):
     
     if change_notify:
         print(f"   {change_msg}")
+        # 发送通知
+        send_notification(
+            f"价格变动：{monitor['name']}",
+            f"{change_msg}\n当前价：¥{current_price}\n链接：{detail.get('appUrl', 'N/A')}"
+        )
+    
     if target_notify:
         print(f"   🎉 已达到目标价 ¥{monitor['target_price']}!")
+        # 发送通知
+        send_notification(
+            f"🎉 目标价达成：{monitor['name']}",
+            f"当前价：¥{current_price} ≤ 目标价：¥{monitor['target_price']}\n链接：{detail.get('appUrl', 'N/A')}"
+        )
     
     return {
         "monitor_id": monitor_id,
@@ -540,6 +588,58 @@ async def config_monitor(args):
     print(f"   自动通知：{'开启' if config['auto_notify'] else '关闭'}")
 
 
+async def show_stats(args):
+    """显示省钱统计"""
+    monitors = load_monitors()
+    
+    if not monitors:
+        print("📭 暂无监控数据")
+        return
+    
+    total_saved = 0
+    total_original = 0
+    deals_count = 0
+    
+    print("📊 省钱统计\n")
+    print(f"{'商品':<25} {'原价':<10} {'现价':<10} {'节省':<10} {'状态'}")
+    print("-" * 70)
+    
+    for m in monitors:
+        if not m.get("enabled", True):
+            continue
+        
+        last_price = m.get("last_price")
+        history_file = HISTORY_DIR / f"{m['id']}.json"
+        
+        if history_file.exists() and last_price:
+            with open(history_file, "r", encoding="utf-8") as f:
+                history = json.load(f)
+            
+            if history:
+                # 找到最高价作为原价参考
+                max_price = max(h.get("price", 0) for h in history)
+                saved = max_price - last_price
+                
+                if saved > 0:
+                    deals_count += 1
+                    total_saved += saved
+                    total_original += max_price
+                    
+                    name = m['name'][:23] + ".." if len(m['name']) > 25 else m['name']
+                    print(f"{name:<25} ¥{max_price:<9.0f} ¥{last_price:<9.0f} ¥{saved:<9.0f} ✅")
+    
+    print("-" * 70)
+    print(f"\n📈 总计:")
+    print(f"   监控商品：{len([m for m in monitors if m.get('enabled', True)])} 个")
+    print(f"   好价商品：{deals_count} 个")
+    if total_saved > 0:
+        save_pct = (total_saved / total_original * 100) if total_original > 0 else 0
+        print(f"   累计节省：¥{total_saved:.0f} ({save_pct:.0f}%)")
+        print(f"\n💡 继续监控，省更多！")
+    else:
+        print(f"   累计节省：暂无数据（持续监控中...）")
+
+
 async def main():
     global SESSION
     connector = aiohttp.TCPConnector(ssl=SSL_CONTEXT)
@@ -589,6 +689,10 @@ async def main():
         config_parser.add_argument("--threshold", type=float, help="价格变化阈值 (0.05 表示 5%%)")
         config_parser.set_defaults(func=config_monitor)
         
+        # stats 命令
+        stats_parser = parsers.add_parser("stats", help="查看省钱统计")
+        stats_parser.set_defaults(func=show_stats)
+        
         args = parser.parse_args()
         if hasattr(args, "func"):
             await args.func(args)
@@ -597,4 +701,8 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Windows 下设置 UTF-8 输出
+    if sys.platform == "win32":
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     asyncio.run(main())
