@@ -4,8 +4,13 @@
 # dependencies = ["aiohttp", "PyYAML"]
 # ///
 """
-自动价格检查脚本
+自动价格检查脚本（优化版）
 用于 OpenClaw cron 定时任务，定期检查所有商品价格并发送通知
+
+优化：
+- 错峰检查（避免 API 限流）
+- 使用缓存（减少重复请求）
+- 只记录价格变化点（节省存储）
 """
 import asyncio
 import sys
@@ -15,25 +20,31 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(BASE_DIR / "scripts"))
 
-from main import check_all_prices, load_monitors
+from main import check_all_prices, list_monitors_sync, init_database
 
 
 async def main():
     """自动检查所有商品价格"""
-    monitors = load_monitors()
-    active_monitors = [m for m in monitors if m.get("enabled", True)]
+    # 初始化数据库
+    init_database()
     
-    if not active_monitors:
+    monitors = list_monitors_sync()
+    
+    if not monitors:
         print("📭 暂无启用的监控商品")
         return
     
-    print(f"🔍 [自动检查] 正在检查 {len(active_monitors)} 个商品价格...\n")
+    print(f"🔍 [自动检查] 正在检查 {len(monitors)} 个商品价格...\n")
     
-    # 调用检查函数
+    # 调用检查函数（已内置错峰逻辑）
     await check_all_prices(type('Args', (), {'all': True})())
     
     print("\n✅ 自动检查完成")
 
 
 if __name__ == "__main__":
+    # Windows 下设置 UTF-8 输出
+    if sys.platform == "win32":
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     asyncio.run(main())
