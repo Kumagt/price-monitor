@@ -1,4 +1,4 @@
- /// script
+ # /// script
 # requires-python = ">=3.11"
 # dependencies = ["aiohttp"]
 # ///
@@ -66,6 +66,7 @@ def init_database():
             source INTEGER NOT NULL,
             name TEXT,
             target_price REAL,
+            group_name TEXT DEFAULT '',
             created_at TEXT,
             last_price REAL,
             last_check TEXT,
@@ -73,6 +74,13 @@ def init_database():
             UNIQUE(goods_id, source)
         )
     """)
+    
+    # 迁移：为已有数据库增加 group_name 字段
+    try:
+        DB_CONN.execute("ALTER TABLE monitors ADD COLUMN group_name TEXT DEFAULT ''")
+        DB_CONN.commit()
+    except Exception:
+        pass  # 字段已存在
     
     # 价格历史表（只记录变化点）
     DB_CONN.execute("""
@@ -210,13 +218,13 @@ def cleanup_old_history(days: int = 30):
         print(f"🧹 已清理 {cursor.rowcount} 条旧记录（>{days}天）")
 
 
-def add_monitor_sync(goods_id: str, source: int, name: str, target_price: Optional[float] = None) -> int:
+def add_monitor_sync(goods_id: str, source: int, name: str, target_price: Optional[float] = None, group_name: str = "") -> int:
     """添加监控（同步）"""
     conn = get_db()
     cursor = conn.execute(
-        """INSERT OR IGNORE INTO monitors (goods_id, source, name, target_price, created_at, enabled)
-           VALUES (?, ?, ?, ?, ?, 1)""",
-        (goods_id, source, name, target_price, datetime.now().isoformat())
+        """INSERT OR IGNORE INTO monitors (goods_id, source, name, target_price, group_name, created_at, enabled)
+           VALUES (?, ?, ?, ?, ?, ?, 1)""",
+        (goods_id, source, name, target_price, group_name, datetime.now().isoformat())
     )
     conn.commit()
     
@@ -408,10 +416,313 @@ async def get_goods_detail(goods_id: str, source: int) -> Optional[Dict]:
         return None
 
 
+# 平台名称映射
+SOURCE_NAMES = {1: "淘宝", 2: "京东", 3: "拼多多", 7: "抖音", 8: "快手"}
+
+
+async def compare_goods(args):
+    """多源比价：同时查询多个平台的同一商品"""
+    source_ids = [int(x.strip()) for x in args.sources.split(",")]
+    goods_id = args.id
+    
+    if len(source_ids) < 2:
+        print("❌ 多源比价至少需要 2 个平台")
+        return
+    
+    print(f"🔍 正在比价：商品 {goods_id}\n")
+    print(f"{'平台':<10} {'当前价':<10} {'原价':<10} {'状态'}")
+    print("-" * 70)
+    
+    results = []
+    for source in source_ids:
+        source_name = SOURCE_NAMES.get(source, f"平台{source}")
+        print(f"⏳ {source_name}...")
+        try:
+            detail = await get_goods_detail(goods_id, source)
+            if detail:
+                results.append({
+                    "name": source_name,
+                    "source": source,
+                    "price": detail["actualPrice"],
+                    "original": detail["originalPrice"],
+                    "url": detail.get("appUrl", ""),
+                    "coupon": detail.get("couponPrice", 0),
+                })
+        except Exception as e:
+            print(f"  ❌ {source_name} 查询失败")
+        
+        await asyncio.sleep(0.2)
+    
+    if not results:
+        print("\n❌ 所有平台查询均失败")
+        return
+    
+    # 找最低价
+    min_price = min(r["price"] for r in results)
+    max_price = max(r["price"] for r in results)
+    save_pct = (max_price - min_price) / max_price * 100
+    
+    print("\n" + "=" * 70)
+    print(f"📊 比价结果（共 {len(results)} 个平台）：\n")
+    
+    # 排序：最低价在前
+    results.sort(key=lambda x: x["price"])
+    
+    for r in results:
+        is_lowest = r["price"] == min_price
+        is_highest = r["price"] == max_price and len(results) > 1
+        
+        flag = ""
+        if is_lowest:
+            flag = " 🏆最低"
+        elif is_highest:
+            flag = " (最高)"
+        
+        price_str = f"¥{r['price']:.0f}"
+        orig_str = f"¥{r['original']:.0f}"
+        
+        # 计算折扣
+        if r['coupon'] > 0:
+            price_str += f" (券¥{r['coupon']})"
+        
+        print(f"{r['name']:<10} {price_str:<12} {orig_str:<10}{flag}")
+        if r["url"]:
+            print(f"   {'':<10} 链接：{r['url'][:60]}...")
+    
+    print(f"\n💰 价差：¥{max_price - min_price:.0f}（{save_pct:.1f}%）")
+    print(f"💡 建议：选择最低价平台可节省 ¥{max_price - min_price:.0f}！")
+
+
+async def show_trend(args):
+    """展示商品价格历史趋势图（ASCII字符画）"""
+    monitor_id = int(args.id)
+    days = args.days
+    
+    conn = get_db()
+    
+    # 获取商品名称
+    cursor = conn.execute("SELECT name FROM monitors WHERE id = ?", (monitor_id,))
+    row = cursor.fetchone()
+    if not row:
+        print(f"❌ 未找到监控 #{monitor_id}")
+        return
+    name = row["name"]
+    
+    # 查询历史数据
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    cursor = conn.execute(
+        """SELECT price, original_price, timestamp FROM price_history 
+           WHERE monitor_id = ? AND is_change_point = 1
+           AND timestamp > ?
+           ORDER BY timestamp ASC""",
+        (monitor_id, cutoff)
+    )
+    records = [dict(r) for r in cursor.fetchall()]
+    
+    if len(records) < 2:
+        print(f"📭 监控 {name} 近 {days} 天内数据不足，需要至少 2 个价格点")
+        return
+    
+    prices = [r["price"] for r in records]
+    timestamps = [r["timestamp"] for r in records]
+    
+    min_price = min(prices)
+    max_price = max(prices)
+    avg_price = sum(prices) / len(prices)
+    
+    # 如果价格范围太小，自动扩展显示范围
+    price_range = max_price - min_price
+    padding = price_range * 0.1 if price_range > 0 else 1.0
+    p_min = min_price - padding
+    p_max = max_price + padding
+    
+    # 图表参数
+    chart_height = 15
+    chart_width = min(len(records) - 1, 40)
+    
+    # 计算每个数据点在图表中的位置
+    chart_data = []
+    for i, p in enumerate(prices):
+        y = int((p - p_min) / (p_max - p_min) * chart_height)
+        x = int(i / max(len(prices) - 1, 1) * chart_width)
+        chart_data.append((x, min(y, chart_height)))
+    
+    # 初始化空白图表
+    chart = [[" " for _ in range(chart_width + 1)] for _ in range(chart_height + 1)]
+    
+    # 标记数据点
+    for i, (x, y) in enumerate(chart_data):
+        chart[y][x] = "\u2588"  # █
+    
+    # 连接相邻点（用竖线和斜线）
+    for i in range(len(chart_data) - 1):
+        x1, y1 = chart_data[i]
+        x2, y2 = chart_data[i + 1]
+        
+        # 垂直线
+        step = 1 if y2 > y1 else -1
+        for y in range(y1 + step, y2 + 1, step):
+            if chart[y][x1] == " ":
+                chart[y][x1] = "│"
+        
+        # 斜线
+        if x1 != x2:
+            slope = (y2 - y1) / (x2 - x1) if x2 != x1 else 0
+            for x in range(x1 + 1, x2 + 1):
+                y = int(y1 + slope * (x - x1))
+                if 0 <= y <= chart_height:
+                    if chart[y][x] == " ":
+                        chart[y][x] = "\u2591"  # ░
+    
+    print(f"📈 {name} 价格趋势（最近 {days} 天）\n")
+    
+    # 打印图表
+    step = max(1, len(prices) // chart_height)
+    for i in range(chart_height, -1, -1):
+        target_price = p_min + (p_max - p_min) * i / chart_height
+        line = f"¥{target_price:,.0f} │"
+        for x in range(chart_width):
+            line += chart[i][x]
+        print(line)
+    
+    # X轴
+    line = " " * 10 + " ├──"
+    line += "─" * chart_width
+    print(line)
+    
+    # X轴标签
+    first_date = timestamps[0][:10]
+    last_date = timestamps[-1][:10]
+    mid_idx = len(timestamps) // 2
+    mid_date = timestamps[mid_idx][:10]
+    label_line = " " * 10 + "   " + first_date.ljust(15) + mid_date.ljust(15) + last_date
+    print(label_line)
+    
+    # 统计信息
+    print(f"\n📊 统计：")
+    print(f"   📈 最高价：¥{max_price:.0f}（{max(prices)}）")
+    print(f"   📉 最低价：¥{min_price:.0f}（{min(prices)}）")
+    print(f"   📊 平均价：¥{avg_price:.0f}（{prices}）")
+    
+    first_change = (prices[-1] - prices[0]) / prices[0] * 100
+    print(f"   📈 期间变化：{first_change:+.1f}%")
+    
+    # 趋势判断
+    if len(prices) >= 3:
+        # 简单趋势判断：后半段均值 vs 前半段均值
+        mid = len(prices) // 2
+        first_half_avg = sum(prices[:mid]) / mid
+        second_half_avg = sum(prices[mid:]) / (len(prices) - mid)
+        trend_pct = (second_half_avg - first_half_avg) / first_half_avg * 100
+        
+        if trend_pct < -2:
+            print(f"   \U0001F4C9 趋势：降价中（-{abs(trend_pct):.1f}%）")
+        elif trend_pct > 2:
+            print(f"   \U0001F4C8 趋势：涨价中（+{trend_pct:.1f}%）")
+        else:
+            print(f"   ↔️ 趋势：平稳（±{abs(trend_pct):.1f}%）")
+
+
+async def show_low_price(args):
+    """显示历史低价商品排名"""
+    top_n = args.top if args.top else 10
+    days = args.days if args.days else 30
+    
+    monitors = list_monitors_sync()
+    
+    if not monitors:
+        print("📭 暂无监控商品")
+        return
+    
+    conn = get_db()
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    
+    results = []
+    for m in monitors:
+        if not m.get("enabled", 1):
+            continue
+        
+        current_price = m.get("last_price", 0)
+        if not current_price:
+            continue
+        
+        # 查询历史最低价
+        cursor = conn.execute(
+            "SELECT MIN(price) as min_price FROM price_history "
+            "WHERE monitor_id = ? AND timestamp > ?",
+            (m["id"], cutoff)
+        )
+        row = cursor.fetchone()
+        low_price = row["min_price"] if row and row["min_price"] else current_price
+        
+        # 计算距离历史低价的百分比
+        if low_price > 0:
+            pct = (current_price - low_price) / low_price * 100
+        else:
+            pct = 0
+        
+        # 计算距离最高价的百分比（推荐度）
+        cursor = conn.execute(
+            "SELECT MAX(price) as max_price FROM price_history "
+            "WHERE monitor_id = ? AND timestamp > ?",
+            (m["id"], cutoff)
+        )
+        row = cursor.fetchone()
+        high_price = row["max_price"] if row and row["max_price"] else current_price
+        
+        save_pct = 0
+        if high_price > 0 and current_price < high_price:
+            save_pct = (high_price - current_price) / high_price * 100
+        
+        # 推荐度：距离历史低价越近越值得
+        if pct <= 1:
+            score = 5  # 接近历史低价
+        elif pct <= 5:
+            score = 4
+        elif pct <= 10:
+            score = 3
+        elif pct <= 20:
+            score = 2
+        else:
+            score = 1
+        
+        results.append({
+            "name": m["name"],
+            "current": current_price,
+            "low": low_price,
+            "high": high_price,
+            "pct": pct,
+            "score": score,
+            "source": SOURCE_NAMES.get(m["source"], "未知"),
+        })
+    
+    # 按推荐度排序
+    results.sort(key=lambda x: x["score"], reverse=True)
+    
+    if not results:
+        print("📭 暂无可用数据")
+        return
+    
+    results = results[:top_n]
+    
+    print(f"🏆 历史低价商品排名（最近 {days} 天）\n")
+    print(f"{'':<4} {'商品':<20} {'平台':<6} {'当前价':<10} {'历史低价':<10} {'距低':<8} {'推荐度'}")
+    print("-" * 75)
+    
+    for i, r in enumerate(results, 1):
+        pct_str = f"{r['pct']:+.1f}%" if r['pct'] > 0 else "✅"
+        stars = "⭐" * r["score"] + "☆" * (5 - r["score"])
+        name = r["name"][:18] if len(r["name"]) > 18 else r["name"]
+        
+        print(f"{i:<4} {name:<20} {r['source']:<6} ¥{r['current']:<9.0f} ¥{r['low']:<9.0f} {pct_str:<8} {stars}")
+    
+    print(f"\n💡 显示 Top {len(results)} 个商品，推荐度越高分值越低越值得买！")
+
+
 async def add_monitor(args):
     """添加监控商品"""
     monitor_id = add_monitor_sync(args.id, int(args.source), args.name or f"商品{args.id}", 
-                                   float(args.target_price) if args.target_price else None)
+                                   float(args.target_price) if args.target_price else None, "")
     
     if monitor_id == 0:
         print(f"⚠️ 该商品已在监控中")
@@ -661,7 +972,7 @@ async def search_and_monitor(args):
     
     if choice == 'a':
         for item in results:
-            monitor_id = add_monitor_sync(str(item['goods_id']), source, item['title'][:50], target_price)
+            monitor_id = add_monitor_sync(str(item['goods_id']), source, item['title'][:50], target_price, "")
             if monitor_id:
                 added_count += 1
         
@@ -684,7 +995,7 @@ async def search_and_monitor(args):
             
             for idx in selected:
                 item = results[idx]
-                add_monitor_sync(str(item['goods_id']), source, item['title'][:50], target_price)
+                add_monitor_sync(str(item['goods_id']), source, item['title'][:50], target_price, "")
                 added_count += 1
             
             print(f"\n✅ 已添加 {added_count} 个监控商品！")
@@ -777,6 +1088,117 @@ async def show_stats(args):
         print(f"   累计节省：暂无数据（持续监控中...）")
 
 
+async def group(args):
+    """分组管理主函数"""
+    if not hasattr(args, 'group_cmd') or not args.group_cmd:
+        # 无子命令，显示所有分组
+        await group_list(args)
+        return
+    
+    group_cmd = args.group_cmd
+    
+    if group_cmd == "add":
+        await group_add(args)
+    elif group_cmd == "remove":
+        await group_remove(args)
+    elif group_cmd == "list":
+        await group_list(args)
+    elif group_cmd == "show":
+        await group_show(args)
+    elif group_cmd == "delete":
+        await group_delete(args)
+    else:
+        print(f"❌ 未知分组命令: {group_cmd}")
+        print("可用命令: add, remove, list, show, delete")
+
+
+async def group_add(args):
+    """添加商品到分组"""
+    conn = get_db()
+    conn.execute(
+        "UPDATE monitors SET group_name = ? WHERE id = ?",
+        (args.name, int(args.id))
+    )
+    conn.commit()
+    print(f"✅ 已将监控 #{args.id} 添加到分组 '{args.name}'")
+
+
+async def group_remove(args):
+    """将商品从分组中移除"""
+    conn = get_db()
+    conn.execute(
+        "UPDATE monitors SET group_name = '' WHERE id = ?",
+        (int(args.id),)
+    )
+    conn.commit()
+    print(f"✅ 已从分组中移除监控 #{args.id}")
+
+
+async def group_list(args):
+    """列出所有分组"""
+    monitors = list_monitors_sync()
+    
+    if not monitors:
+        print("📭 暂无监控数据")
+        return
+    
+    groups = {}
+    for m in monitors:
+        group_name = m.get("group_name") or "未分组"
+        if group_name not in groups:
+            groups[group_name] = []
+        groups[group_name].append(m)
+    
+    print(f"📦 商品分组 (共 {len(groups)} 个)\n")
+    
+    for name, items in groups.items():
+        if name == "未分组":
+            print(f"  📭 {name}: {len(items)} 个商品")
+        else:
+            print(f"  📁 {name}: {len(items)} 个商品")
+            for item in items:
+                print(f"      - #{item['id']} {item['name']} (¥{item.get('last_price', 'N/A')})")
+        print()
+
+
+async def group_show(args):
+    """查看指定分组"""
+    monitors = list_monitors_sync()
+    
+    if not monitors:
+        print("📭 暂无监控数据")
+        return
+    
+    group_monitors = [m for m in monitors if (m.get("group_name") or "") == args.name]
+    
+    if not group_monitors:
+        print(f"📭 分组 '{args.name}' 为空")
+        return
+    
+    print(f"📁 分组 '{args.name}' ({len(group_monitors)} 个商品)\n")
+    print(f"{'ID':<4} {'名称':<20} {'平台':<8} {'当前价':<10} {'目标价':<10}")
+    print("-" * 60)
+    
+    source_names = {1: "淘宝", 2: "京东", 3: "拼多多", 7: "抖音", 8: "快手"}
+    
+    for m in group_monitors:
+        price_str = f"¥{m.get('last_price', 'N/A')}" if m.get('last_price') else "N/A"
+        target_str = f"¥{m['target_price']}" if m.get('target_price') else "-"
+        name = m['name'][:18] + ".." if len(m['name']) > 20 else (m['name'] or "未知")
+        print(f"{m['id']:<4} {name:<20} {source_names.get(m['source'], '未知'):<8} {price_str:<10} {target_str:<10}")
+
+
+async def group_delete(args):
+    """删除分组（将组内商品移到未分组）"""
+    conn = get_db()
+    conn.execute(
+        "UPDATE monitors SET group_name = '' WHERE group_name = ?",
+        (args.name,)
+    )
+    conn.commit()
+    print(f"✅ 已删除分组 '{args.name}'，商品已移到未分组")
+
+
 async def cleanup(args):
     """清理旧数据和缓存"""
     config = load_config()
@@ -866,6 +1288,60 @@ async def main():
         # cleanup 命令
         cleanup_parser = parsers.add_parser("cleanup", help="清理旧数据和缓存")
         cleanup_parser.set_defaults(func=cleanup)
+        
+        # low-price 命令
+        lowprice_parser = parsers.add_parser("low-price", help="查看历史低价商品排名")
+        lowprice_parser.add_argument("--top", type=int, default=10, help="显示数量（默认 10）")
+        lowprice_parser.add_argument("--days", type=int, default=30, help="查询天数（默认 30）")
+        lowprice_parser.set_defaults(func=show_low_price)
+        
+        # compare 命令
+        compare_parser = parsers.add_parser("compare", help="多源比价")
+        compare_parser.add_argument("--id", required=True, help="商品 ID")
+        compare_parser.add_argument("--sources", required=True, help="平台列表，逗号分隔 (如 1,2,3)")
+        compare_parser.set_defaults(func=compare_goods)
+        
+        # trend 命令
+        trend_parser = parsers.add_parser("trend", help="查看价格趋势图")
+        trend_parser.add_argument("--id", required=True, help="监控 ID")
+        trend_parser.add_argument("--days", type=int, default=30, help="查询天数（默认 30）")
+        trend_parser.set_defaults(func=show_trend)
+        
+        # group 命令
+        group_parser = parsers.add_parser("group", help="商品分组管理")
+        group_subparsers = group_parser.add_subparsers()
+        
+        group_add_parser = group_subparsers.add_parser("add", help="添加商品到分组")
+        group_add_parser.add_argument("--name", required=True, help="分组名称")
+        group_add_parser.add_argument("--id", required=True, help="监控 ID")
+        group_add_parser.set_defaults(func=group_add)
+        
+        group_remove_parser = group_subparsers.add_parser("remove", help="从分组中移除商品")
+        group_remove_parser.add_argument("--id", required=True, help="监控 ID")
+        group_remove_parser.set_defaults(func=group_remove)
+        
+        group_list_parser = group_subparsers.add_parser("list", help="列出所有分组")
+        group_list_parser.set_defaults(func=group_list)
+        
+        group_show_parser = group_subparsers.add_parser("show", help="查看指定分组")
+        group_show_parser.add_argument("--name", required=True, help="分组名称")
+        group_show_parser.set_defaults(func=group_show)
+        
+        group_delete_parser = group_subparsers.add_parser("delete", help="删除分组")
+        group_delete_parser.add_argument("--name", required=True, help="分组名称")
+        group_delete_parser.set_defaults(func=group_delete)
+        
+        # 让 group 主命令也可以调用 list
+        group_list_only_parser = group_parser.add_parser("list", help="列出所有分组")
+        group_list_only_parser.set_defaults(func=group_list)
+        
+        # 将 group 子命令标记到 args
+        group_parser.set_defaults(group_cmd=None)
+        group_add_parser.set_defaults(group_cmd="add")
+        group_remove_parser.set_defaults(group_cmd="remove")
+        group_list_parser.set_defaults(group_cmd="list")
+        group_show_parser.set_defaults(group_cmd="show")
+        group_delete_parser.set_defaults(group_cmd="delete")
         
         args = parser.parse_args()
         if hasattr(args, "func"):
