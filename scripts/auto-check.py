@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["aiohttp", "PyYAML"]
+# dependencies = ["aiohttp"]
 # ///
 """
 自动价格检查脚本（优化版）

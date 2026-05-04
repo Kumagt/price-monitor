@@ -1,6 +1,6 @@
-# /// script
+ /// script
 # requires-python = ">=3.11"
-# dependencies = ["aiohttp", "PyYAML"]
+# dependencies = ["aiohttp"]
 # ///
 """
 电商价格监控工具 - 优化版
@@ -13,7 +13,6 @@
 import os
 import sys
 import json
-import yaml
 import asyncio
 import aiohttp
 import ssl
@@ -44,8 +43,6 @@ HEADERS = {
 
 # SSL 配置
 SSL_CONTEXT = ssl.create_default_context()
-SSL_CONTEXT.check_hostname = False
-SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 
 # 缓存配置
 CACHE_TTL_SECONDS = 300  # 5 分钟缓存
@@ -157,12 +154,19 @@ def is_cache_valid(cache: Dict, key: str, ttl: int = CACHE_TTL_SECONDS) -> bool:
     """检查缓存是否有效"""
     if key not in cache:
         return False
-    cached_time = datetime.fromisoformat(cache[key]["timestamp"])
-    return (datetime.now() - cached_time).total_seconds() < ttl
+    try:
+        cached_time = datetime.fromisoformat(cache[key]["timestamp"])
+        return (datetime.now() - cached_time).total_seconds() < ttl
+    except (ValueError, TypeError):
+        return False
 
 
 def send_notification(title: str, message: str):
     """发送通知到 OpenClaw"""
+    config = load_config()
+    if not config.get("auto_notify", True):
+        return  # 用户关闭了自动通知
+    
     try:
         notification_file = Path.home() / ".openclaw" / "workspace" / "notifications" / "price-monitor.json"
         notification_file.parent.mkdir(exist_ok=True)
@@ -472,16 +476,24 @@ async def check_single_price(monitor_id: int):
     # 更新监控记录
     update_monitor_price(monitor_id, current_price, detail.get("title", ""), detail.get("appUrl", ""))
     
-    # 记录价格历史（只记录变化点）
+    # 只记录价格变化点（节省存储空间）
     is_change = False
-    if last_price and abs(current_price - last_price) / last_price >= 0.01:  # 1% 变化
-        is_change = True
-        record_price_point(monitor_id, current_price, detail["originalPrice"], 
-                          detail.get("title", ""), detail.get("appUrl", ""), True)
+    if last_price and last_price > 0:
+        change_ratio = abs(current_price - last_price) / last_price
+        config = load_config()
+        threshold = config.get("price_change_threshold", 0.01)
+        if change_ratio >= threshold:
+            is_change = True
+            record_price_point(monitor_id, current_price, detail["originalPrice"],
+                              detail.get("title", ""), detail.get("appUrl", ""), True)
+            print(f"   价格变化点：{change_ratio*100:+.1f}%")
+        else:
+            print(f"   价格无变化（{change_ratio*100:.1f}% < 阈值 {threshold*100:.0f}%），跳过记录")
     else:
-        # 非变化点也记录，但不标记为 change_point
-        record_price_point(monitor_id, current_price, detail["originalPrice"], 
-                          detail.get("title", ""), detail.get("appUrl", ""), False)
+        # 首次监控，无历史价格，记录初始值
+        is_change = True
+        record_price_point(monitor_id, current_price, detail["originalPrice"],
+                          detail.get("title", ""), detail.get("appUrl", ""), True)
     
     # 检查价格变化
     config = load_config()
@@ -694,8 +706,9 @@ async def config_monitor(args):
         print(f"✅ 检查间隔已设置为 {args.interval} 分钟")
     
     if args.threshold:
-        config["price_change_threshold"] = float(args.threshold)
-        print(f"✅ 价格变化阈值已设置为 {args.threshold*100:.0f}%")
+        new_threshold = float(args.threshold)
+        config["price_change_threshold"] = new_threshold
+        print(f"✅ 价格变化阈值已设置为 {new_threshold*100:.0f}%")
     
     if args.cache_ttl:
         config["cache_ttl_seconds"] = int(args.cache_ttl)
