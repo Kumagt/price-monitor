@@ -1333,9 +1333,8 @@ async def main():
         group_delete_parser.add_argument("--name", required=True, help="分组名称")
         group_delete_parser.set_defaults(func=group_delete)
         
-        # 让 group 主命令也可以调用 list
-        group_list_only_parser = group_parser.add_parser("list", help="列出所有分组")
-        group_list_only_parser.set_defaults(func=group_list)
+        # 让 group 主命令（无子命令时）默认调用 list
+        group_parser.set_defaults(func=group_list)
         
         # 将 group 子命令标记到 args
         group_parser.set_defaults(group_cmd=None)
