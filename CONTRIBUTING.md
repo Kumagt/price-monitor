@@ -11,6 +11,7 @@
 **提交前请确认：**
 - 没有重复的 Issue
 - 提供了复现步骤和错误日志
+- 注明了版本号和平台
 
 ### 提出建议
 
@@ -24,15 +25,22 @@
 
 1. Fork 本仓库
 2. 创建特性分支 (`git checkout -b feature/your-feature`)
-3. 提交更改 (`git commit -m 'Add your feature'`)
+3. 提交更改 (`git commit -m 'feat: add your feature'`)
 4. 推送到分支 (`git push origin feature/your-feature`)
 5. 开启 Pull Request
 
+**提交规范（Conventional Commits）：**
+- `feat:` 新功能
+- `fix:` Bug 修复
+- `docs:` 文档更新
+- `chore:` 构建/工具/配置变更
+- `refactor:` 代码重构
+
 **代码规范：**
-- 遵循 PEP 8 风格
-- 添加必要的注释
+- Python 3.11+ 兼容
+- 使用 aiohttp 异步请求
+- 函数/类添加文档字符串
 - 确保代码可正常运行
-- 更新相关文档
 
 ### 分享项目
 
@@ -53,18 +61,14 @@
 ### 安装步骤
 
 ```bash
-# 克隆仓库
 git clone https://github.com/Kumagt/price-monitor.git
 cd price-monitor
-
-# 安装依赖
-uv sync
 
 # 验证安装
 uv run scripts/main.py --help
 ```
 
-### 手动测试
+### 测试
 
 ```bash
 # 添加测试监控
@@ -73,8 +77,11 @@ uv run scripts/main.py add --source=1 --id=测试ID --name="测试商品"
 # 检查价格
 uv run scripts/main.py check --id=1
 
-# 查看历史
-uv run scripts/main.py history --id=1
+# 启动 Web UI
+uv run scripts/main.py webui
+
+# 启动 API Server
+uv run scripts/main.py api-server
 ```
 
 ---
@@ -82,12 +89,6 @@ uv run scripts/main.py history --id=1
 ## 文档贡献
 
 文档也可以贡献！错别字纠正、表达优化、补充示例都欢迎。
-
----
-
-## 讨论
-
-有疑问或想法？欢迎在 [GitHub Discussions](https://github.com/Kumagt/price-monitor/discussions) 或 Issue 评论区交流。
 
 ---
 
