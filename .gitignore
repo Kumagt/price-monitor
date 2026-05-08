@@ -38,3 +38,7 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# OpenClaw workspace
+memory/
+tasks/

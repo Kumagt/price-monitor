@@ -55,6 +55,13 @@ SSL_CONTEXT = ssl.create_default_context()
 
 logger = logging.getLogger(__name__)
 
+# 日志配置
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
 # 重试配置
 RETRY_MAX_ATTEMPTS = 3
 RETRY_BASE_DELAY = 1  # 指数退避基数(秒)
@@ -1702,26 +1709,32 @@ async def search_and_monitor(args):
 
 
 async def config_monitor(args):
-    """配置监控参数"""
+    """配置监控参数。无参数时仅显示当前配置。"""
     config = load_config()
+
+    has_changes = False
 
     if args.interval:
         config["check_interval_minutes"] = int(args.interval)
         print(f"✅ 检查间隔已设置为 {args.interval} 分钟")
+        has_changes = True
 
     if args.threshold:
         new_threshold = float(args.threshold)
         config["price_change_threshold"] = new_threshold
         print(f"✅ 价格变化阈值已设置为 {new_threshold*100:.0f}%")
+        has_changes = True
 
     if args.cache_ttl:
         config["cache_ttl_seconds"] = int(args.cache_ttl)
         print(f"✅ API 缓存时间已设置为 {args.cache_ttl} 秒")
+        has_changes = True
 
     # 通知渠道配置
     if args.notify_channel:
         config["notify_channel"] = args.notify_channel
         print(f"✅ 通知渠道已设置为:{args.notify_channel}")
+        has_changes = True
 
     if args.notify_webhook_url is not None:
         config["notify_webhook_url"] = args.notify_webhook_url
@@ -1729,30 +1742,37 @@ async def config_monitor(args):
             print(f"✅ Webhook URL 已设置")
         else:
             print(f"✅ Webhook URL 已清除")
+        has_changes = True
 
     if args.notify_email_smtp is not None:
         config["notify_email_smtp"] = args.notify_email_smtp
         print(f"✅ SMTP 服务器已设置" if args.notify_email_smtp else f"✅ SMTP 服务器已清除")
+        has_changes = True
 
     if args.notify_email_from is not None:
         config["notify_email_from"] = args.notify_email_from
         print(f"✅ 发件人邮箱已设置" if args.notify_email_from else f"✅ 发件人邮箱已清除")
+        has_changes = True
 
     if args.notify_email_to is not None:
         config["notify_email_to"] = args.notify_email_to
         print(f"✅ 收件人邮箱已设置" if args.notify_email_to else f"✅ 收件人邮箱已清除")
+        has_changes = True
 
     if args.notify_email_password is not None:
         config["notify_email_password"] = args.notify_email_password
         print(f"✅ 邮箱密码已设置" if args.notify_email_password else f"✅ 邮箱密码已清除")
+        has_changes = True
 
     if args.anomaly_threshold is not None:
         config["anomaly_threshold"] = float(args.anomaly_threshold)
         print(f"✅ 异常检测阈值已设置为 {args.anomaly_threshold*100:.0f}%")
+        has_changes = True
 
     if args.anomaly_trend_count is not None:
         config["anomaly_trend_count"] = int(args.anomaly_trend_count)
         print(f"✅ 连续趋势检测次数已设置为 {args.anomaly_trend_count} 次")
+        has_changes = True
 
     if args.invite_code is not None:
         config["invite_code"] = args.invite_code
@@ -1760,8 +1780,13 @@ async def config_monitor(args):
             print(f"✅ 邀请码已设置")
         else:
             print(f"✅ 邀请码已清除")
+        has_changes = True
 
-    save_config(config)
+    if has_changes:
+        save_config(config)
+    else:
+        print("💡 使用 --interval/--threshold/--cache-ttl 等参数修改配置")
+        print("")
 
     print(f"\n当前配置:")
     print(f"   检查间隔:{config['check_interval_minutes']} 分钟")
