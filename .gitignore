@@ -16,6 +16,11 @@ build/
 .uv/
 uv.lock
 
+# 数据库和缓存
+data/price_monitor.db
+data/api_cache.json
+data/exports/
+
 # 数据文件
 data/monitors.json
 data/config.json
