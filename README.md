@@ -1,4 +1,4 @@
-﻿# 电商价格监控助手 v2.0.0
+﻿# 电商价格监控助手 v2.2.0
 
 > **重大更新** - 修复所有严重 Bug，引入重试机制、原子写入、日志框架  
 > 跟踪商品价格变化，设置降价提醒，自动推送优惠信息  
@@ -120,7 +120,7 @@ uv run scripts/main.py config
 
 ---
 
-## v2.0.0 更新内容
+## v2.2.0 更新内容
 
 ### 严重 Bug 修复
 - `auto-check.py` 因 SESSION 未初始化导致运行时崩溃
@@ -151,7 +151,7 @@ price-monitor/
 ├── README.md             # 本文件
 ├── .env.example          # 环境变量示例
 ├── scripts/
-│   ├── main.py           # 主程序（v2.0.0 优化版）
+│   ├── main.py           # 主程序（v2.2.0 优化版）
 │   └── auto-check.py     # 定时检查脚本
 └── data/
     ├── price_monitor.db  # SQLite 数据库
@@ -173,6 +173,15 @@ price-monitor/
 ---
 
 ## 更新日志
+
+### v2.2.0 (2026-05-08)
+- 新增价格预测（纯 Python 线性回归）
+- 新增价格历史导出（CSV / XLSX）
+
+### v2.1.0 (2026-05-08)
+- 新增多通知渠道（JSON / Webhook / Email）
+- 新增导入/导出监控列表（JSON + CSV）
+- 新增价格异常检测（暴涨暴跌告警）
 
 ### v2.0.0 (2026-05-08)
 - 修复 5 个严重 Bug
@@ -229,6 +238,6 @@ MIT License - 详见 [LICENSE](LICENSE) 文件
 
 [⭐ Star this repo](https://github.com/Kumagt/price-monitor) | [🐛 Report Issue](https://github.com/Kumagt/price-monitor/issues)
 
-**v2.0.0 - 更智能、更高效、更稳定**
+**v2.2.0 - 更智能、更高效、更稳定**
 
 </div>
