@@ -14,13 +14,14 @@
 """
 import asyncio
 import sys
+import aiohttp
 from pathlib import Path
 
 # 导入主模块的功能
 BASE_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(BASE_DIR / "scripts"))
 
-from main import check_all_prices, list_monitors_sync, init_database
+from main import check_all_prices, list_monitors_sync, init_database, SESSION, HEADERS, SSL_CONTEXT
 
 
 async def main():
@@ -36,8 +37,15 @@ async def main():
     
     print(f"🔍 [自动检查] 正在检查 {len(monitors)} 个商品价格...\n")
     
-    # 调用检查函数（已内置错峰逻辑）
-    await check_all_prices(type('Args', (), {'all': True})())
+    # 创建 aiohttp session（main.py 的 check_all_prices 依赖全局 SESSION）
+    connector = aiohttp.TCPConnector(ssl=SSL_CONTEXT)
+    async with aiohttp.ClientSession(headers=HEADERS, connector=connector) as session:
+        # 将 session 赋值给主模块的全局变量
+        import main
+        main.SESSION = session
+        
+        # 调用检查函数（已内置错峰逻辑）
+        await check_all_prices(type('Args', (), {'all': True})())
     
     print("\n✅ 自动检查完成")
 

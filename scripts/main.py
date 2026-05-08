@@ -600,9 +600,9 @@ async def show_trend(args):
     
     # 统计信息
     print(f"\n📊 统计：")
-    print(f"   📈 最高价：¥{max_price:.0f}（{max(prices)}）")
-    print(f"   📉 最低价：¥{min_price:.0f}（{min(prices)}）")
-    print(f"   📊 平均价：¥{avg_price:.0f}（{prices}）")
+    print(f"   📈 最高价：¥{max_price:.0f}")
+    print(f"   📉 最低价：¥{min_price:.0f}")
+    print(f"   📊 平均价：¥{avg_price:.0f}")
     
     first_change = (prices[-1] - prices[0]) / prices[0] * 100
     print(f"   📈 期间变化：{first_change:+.1f}%")
@@ -935,6 +935,7 @@ async def search_and_monitor(args):
     keyword = args.keyword
     source = int(args.source)
     target_price = float(args.target_price) if args.target_price else None
+    group_name = args.group or ""
     limit = int(args.limit) if args.limit else 10
     
     source_names = {1: "淘宝", 2: "京东", 3: "拼多多", 7: "抖音", 8: "快手"}
@@ -972,7 +973,7 @@ async def search_and_monitor(args):
     
     if choice == 'a':
         for item in results:
-            monitor_id = add_monitor_sync(str(item['goods_id']), source, item['title'][:50], target_price, "")
+            monitor_id = add_monitor_sync(str(item['goods_id']), source, item['title'][:50], target_price, group_name)
             if monitor_id:
                 added_count += 1
         
@@ -995,7 +996,7 @@ async def search_and_monitor(args):
             
             for idx in selected:
                 item = results[idx]
-                add_monitor_sync(str(item['goods_id']), source, item['title'][:50], target_price, "")
+                add_monitor_sync(str(item['goods_id']), source, item['title'][:50], target_price, group_name)
                 added_count += 1
             
             print(f"\n✅ 已添加 {added_count} 个监控商品！")
@@ -1271,6 +1272,7 @@ async def main():
         search_parser.add_argument("--keyword", required=True, help="搜索关键词")
         search_parser.add_argument("--source", required=True, help="平台 1:淘宝 2:京东 3:拼多多 7:抖音 8:快手")
         search_parser.add_argument("--target_price", help="目标价格")
+        search_parser.add_argument("--group", help="分组名称")
         search_parser.add_argument("--limit", type=int, default=10, help="返回结果数量（默认 10）")
         search_parser.set_defaults(func=search_and_monitor)
         
