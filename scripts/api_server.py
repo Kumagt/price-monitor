@@ -16,12 +16,8 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse, parse_qs
 
-# 基础目录
-BASE_DIR = Path(__file__).parent.parent
-DATA_DIR = BASE_DIR / "data"
-DB_FILE = DATA_DIR / "price_monitor.db"
-CONFIG_FILE = DATA_DIR / "config.json"
-CACHE_FILE = DATA_DIR / "api_cache.json"
+# 共享数据库模块
+from database import init_database, load_config, save_config, DB_FILE, DATA_DIR, CONFIG_FILE
 
 # SSL 配置
 import ssl
@@ -29,96 +25,7 @@ SSL_CONTEXT = ssl.create_default_context()
 
 VERSION = "2.3.0"
 
-# ---------- 数据库初始化（复用 main.py 逻辑） ----------
-
-
-def init_database(db_file: Path = DB_FILE):
-    """初始化 SQLite 数据库"""
-    DATA_DIR.mkdir(exist_ok=True)
-    conn = sqlite3.connect(str(db_file), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS monitors (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            goods_id TEXT NOT NULL,
-            source INTEGER NOT NULL,
-            name TEXT,
-            target_price REAL,
-            group_name TEXT DEFAULT '',
-            created_at TEXT,
-            last_price REAL,
-            last_check TEXT,
-            enabled INTEGER DEFAULT 1,
-            UNIQUE(goods_id, source)
-        )
-    """)
-
-    try:
-        conn.execute("ALTER TABLE monitors ADD COLUMN group_name TEXT DEFAULT ''")
-        conn.commit()
-    except Exception:
-        pass
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS price_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            monitor_id INTEGER NOT NULL,
-            price REAL NOT NULL,
-            original_price REAL,
-            title TEXT,
-            url TEXT,
-            timestamp TEXT NOT NULL,
-            is_change_point INTEGER DEFAULT 1,
-            FOREIGN KEY (monitor_id) REFERENCES monitors(id)
-        )
-    """)
-
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_history_monitor ON price_history(monitor_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_history_time ON price_history(timestamp)")
-    conn.commit()
-    return conn
-
-
-def load_config(config_file: Path = CONFIG_FILE):
-    """加载配置"""
-    default_config = {
-        "check_interval_minutes": 60,
-        "price_change_threshold": 0.05,
-        "auto_notify": True,
-        "cache_ttl_seconds": 300,
-        "request_delay_ms": 200,
-        "history_retention_days": 30,
-        "max_history_per_item": 100,
-        "anomaly_threshold": 0.3,
-        "anomaly_trend_count": 3,
-        "invite_code": "",
-        "notify_channel": "json",
-        "notify_webhook_url": "",
-        "notify_email_smtp": "",
-        "notify_email_from": "",
-        "notify_email_to": "",
-        "notify_email_password": "",
-    }
-    if config_file.exists():
-        try:
-            with open(config_file, "r", encoding="utf-8") as f:
-                config = json.load(f)
-                return {**default_config, **config}
-        except Exception:
-            pass
-    return default_config
-
-
-def save_config(config: Dict, config_file: Path = CONFIG_FILE):
-    """保存配置(原子写入)"""
-    tmp_file = config_file.with_suffix(".tmp")
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(str(tmp_file), str(config_file))
-
+# ---------- 价格检查 API（需要 aiohttp，延迟导入） ----------
 
 # ---------- 异步价格查询（独立 session，每次请求新建） ----------
 

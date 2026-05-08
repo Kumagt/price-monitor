@@ -2941,16 +2941,23 @@ async def start_webui(args):
             self.wfile.write(b"Method Not Allowed")
 
     # 使用 ThreadingHTTPServer 支持并发请求
-    server = HTTPServer((host, port), WebUIHandler)
-    print(f"\n🌐 Web UI 已启动")
-    print(f"📍 地址：http://{host}:{port}")
-    print(f"🛑 按 Ctrl+C 停止\n")
+    from http.server import ThreadingHTTPServer
+    server = ThreadingHTTPServer((host, port), WebUIHandler)
+    print(f"\nWeb UI 已启动")
+    print(f"地址：http://{host}:{port}")
+    print(f"按 Ctrl+C 停止\n")
+
+    # 在线程中运行，避免阻塞 asyncio event loop
+    import threading
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
 
     try:
-        server.serve_forever()
+        while server_thread.is_alive():
+            await asyncio.sleep(1)
     except KeyboardInterrupt:
-        print("\n🛑 Web UI 已停止")
-        server.server_close()
+        print("\nWeb UI 已停止")
+        server.shutdown()
 
 
 async def run_api_server(args):
