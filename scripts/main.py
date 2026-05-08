@@ -13,6 +13,7 @@
 import os
 import sys
 import json
+import logging
 import asyncio
 import aiohttp
 import ssl
@@ -21,7 +22,8 @@ import sqlite3
 import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable, TypeVar
+from functools import wraps
 
 # 基础目录
 BASE_DIR = Path(__file__).parent.parent
@@ -34,7 +36,12 @@ CACHE_FILE = DATA_DIR / "api_cache.json"
 DATA_DIR.mkdir(exist_ok=True)
 
 # 买手 API 配置
-INVITE_CODE = os.getenv("MAISHOU_INVITE_CODE") or "6110440"
+_INVITE_CODE_ENV = os.getenv("MAISHOU_INVITE_CODE")
+if not _INVITE_CODE_ENV:
+    print("错误：未设置环境变量 MAISHOU_INVITE_CODE")
+    print("    请设置后重新运行，参考 .env.example 文件")
+    sys.exit(1)
+INVITE_CODE = _INVITE_CODE_ENV
 HEADERS = {
     aiohttp.hdrs.ACCEPT: "application/json",
     aiohttp.hdrs.REFERER: "https://hnbc018.kuaizhan.com/",
@@ -44,12 +51,129 @@ HEADERS = {
 # SSL 配置
 SSL_CONTEXT = ssl.create_default_context()
 
+logger = logging.getLogger(__name__)
+
+# 重试配置
+RETRY_MAX_ATTEMPTS = 3
+RETRY_BASE_DELAY = 1  # 指数退避基数（秒）
+
 # 缓存配置
 CACHE_TTL_SECONDS = 300  # 5 分钟缓存
 REQUEST_DELAY_MS = 200   # 请求间隔 200ms，避免触发限流
 
 SESSION: aiohttp.ClientSession | None = None
 DB_CONN: sqlite3.Connection | None = None
+
+
+def _shutdown():
+    """进程退出时清理全局资源（atexit 注册）。
+
+    DB_CONN 是同步 sqlite3 连接，可在 atexit 中安全关闭。
+    SESSION 的生命周期由 main() 中的 async with 管理，此处仅在异常情况下兜底关闭。
+    """
+    global SESSION, DB_CONN
+    if DB_CONN is not None:
+        try:
+            DB_CONN.close()
+            logger.debug("数据库连接已关闭")
+        except Exception as e:
+            logger.warning("关闭数据库连接失败: %s", e)
+        DB_CONN = None
+    if SESSION is not None:
+        try:
+            # atexit 是同步上下文，用同步方式标记 session 关闭
+            if not SESSION.closed:
+                # 创建一个临时事件循环来关闭异步 session
+                loop = asyncio.new_event_loop()
+                loop.run_until_complete(SESSION.close())
+                loop.close()
+        except Exception as e:
+            logger.warning("关闭 SESSION 失败: %s", e)
+        SESSION = None
+
+
+async def retry_async(coro_fn, max_retries: int = 3, backoff: float = 1.0):
+    """通用异步重试：只捕获网络异常（超时、连接错误），不捕获业务异常。
+    
+    coro_fn: 一个无参可调用对象，每次调用返回一个新的协程。
+    max_retries: 最大重试次数
+    backoff: 基础退避秒数（指数退避：backoff * 2^(attempt-1) → 1s, 2s, 4s）
+    """
+    # 网络异常：重试；HTTP 错误 / 解析错误：不重试
+    RETRIABLE = (
+        aiohttp.ClientConnectionError,
+        aiohttp.ClientTimeout,
+        asyncio.TimeoutError,
+        ConnectionError,
+        TimeoutError,
+        OSError,
+    )
+    for attempt in range(max_retries + 1):
+        try:
+            return await coro_fn()
+        except RETRIABLE as e:
+            if attempt < max_retries:
+                delay = backoff * (2 ** attempt)
+                print(f"⚠️ 网络请求失败（{type(e).__name__}: {e}），{delay}s 后重试 ({attempt + 1}/{max_retries})...")
+                await asyncio.sleep(delay)
+            else:
+                print(f"❌ 网络请求失败，已重试 {max_retries} 次，放弃（{type(e).__name__}: {e}）")
+                raise
+
+# ---------- 网络重试工具 ----------
+# 仅对网络层异常（连接失败、超时、DNS 等）进行重试
+# 业务异常（HTTP 错误响应、JSON 解析失败等）不重试
+
+RETRIABLE_EXCEPTIONS = (
+    aiohttp.ClientConnectionError,   # 连接断开、DNS 失败、拒绝连接等
+    aiohttp.ClientTimeout,           # aiohttp 超时
+    asyncio.TimeoutError,            # asyncio 超时
+    ConnectionError,                 # 通用连接错误
+    TimeoutError,                    # 通用超时
+    OSError,                         # 底层 IO 错误（如网络不可达）
+)
+
+F = TypeVar("F", bound=Callable)
+
+
+def with_retry(label: str = "") -> Callable[[F], F]:
+    """
+    异步函数重试装饰器。
+
+    - 最多重试 RETRY_MAX_ATTEMPTS 次
+    - 指数退避：1s, 2s, 4s
+    - 仅对网络层异常重试，业务异常直接抛出
+    - 重试失败后打印明确错误信息
+    """
+    def decorator(func: F) -> F:
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_exc: Exception | None = None
+            for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except RETRIABLE_EXCEPTIONS as e:
+                    last_exc = e
+                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    prefix = f"[{label}] " if label else ""
+                    if attempt < RETRY_MAX_ATTEMPTS:
+                        print(f"⚠️ {prefix}{type(e).__name__}: {e}，{delay}s 后重试（第 {attempt}/{RETRY_MAX_ATTEMPTS} 次）")
+                        await asyncio.sleep(delay)
+                    else:
+                        print(f"❌ {prefix}请求失败（已重试 {RETRY_MAX_ATTEMPTS} 次）：{type(e).__name__}: {e}")
+                except aiohttp.ClientResponseError as e:
+                    # HTTP 4xx/5xx —— 不重试
+                    print(f"❌ [{label if label else func.__name__}] HTTP 错误 {e.status}: {e.message}")
+                    raise
+                except aiohttp.ContentTypeError as e:
+                    # 响应体不是合法 JSON —— 不重试
+                    print(f"❌ [{label if label else func.__name__}] 响应解析失败：{e}")
+                    raise
+            # 所有重试耗尽（理论上不会走到这里，因为最后一次异常会走 else 分支 raise）
+            # 但为了类型安全，兜底抛出
+            raise last_exc
+        return wrapper  # type: ignore[return-value]
+    return decorator
 
 
 def init_database():
@@ -131,9 +255,13 @@ def load_config():
 
 
 def save_config(config):
-    """保存配置"""
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+    """保存配置（原子写入）"""
+    tmp_file = CONFIG_FILE.with_suffix(".tmp")
+    with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(str(tmp_file), str(CONFIG_FILE))
 
 
 def load_api_cache() -> Dict:
@@ -142,15 +270,21 @@ def load_api_cache() -> Dict:
         try:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except:
-            pass
+        except json.JSONDecodeError as e:
+            logger.warning("缓存文件 JSON 解析失败 (%s)，将使用空缓存。文件: %s", e, CACHE_FILE)
+        except Exception as e:
+            logger.warning("加载缓存文件失败 (%s)，将使用空缓存。文件: %s", e, CACHE_FILE)
     return {}
 
 
 def save_api_cache(cache: Dict):
-    """保存 API 缓存"""
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+    """保存 API 缓存（原子写入）"""
+    tmp_file = CACHE_FILE.with_suffix(".tmp")
+    with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(str(tmp_file), str(CACHE_FILE))
 
 
 def get_cache_key(source: int, goods_id: str) -> str:
@@ -280,21 +414,24 @@ async def search_goods(keyword: str, source: int, limit: int = 10) -> List[Dict]
         return cache[cache_key]["data"]
     
     try:
-        resp = await SESSION.post(
-            "https://appapi.maishou88.com/api/v3/goods/list",
-            json={
-                "keyword": keyword,
-                "sourceType": str(source),
-                "inviteCode": INVITE_CODE,
-                "supplierCode": "",
-                "activityId": "",
-                "usageScene": 5,
-                "page": 1,
-                "pageSize": limit,
-            },
-            headers=HEADERS,
-        )
-        data = await resp.json(encoding="utf-8-sig") or {}
+        async def _request():
+            resp = await SESSION.post(
+                "https://appapi.maishou88.com/api/v3/goods/list",
+                json={
+                    "keyword": keyword,
+                    "sourceType": str(source),
+                    "inviteCode": INVITE_CODE,
+                    "supplierCode": "",
+                    "activityId": "",
+                    "usageScene": 5,
+                    "page": 1,
+                    "pageSize": limit,
+                },
+                headers=HEADERS,
+            )
+            return await resp.json(encoding="utf-8-sig") or {}
+
+        data = await retry_async(_request)
         
         result = data.get("data") or data.get("result") or {}
         goods_list = result.get("goodsList") or result.get("list") or result.get("items") or []
@@ -368,28 +505,34 @@ async def get_goods_detail(goods_id: str, source: int) -> Optional[Dict]:
     try:
         # 延迟请求，避免限流
         await asyncio.sleep(config.get("request_delay_ms", REQUEST_DELAY_MS) / 1000)
-        
-        resp = await SESSION.post(
-            "https://appapi.maishou88.com/api/v3/goods/detail",
-            json={
-                **params,
-                "keyword": "",
-                "usageScene": 5,
-            },
-            headers=HEADERS,
-        )
-        data = await resp.json(encoding="utf-8-sig") or {}
+
+        async def _request_detail():
+            resp = await SESSION.post(
+                "https://appapi.maishou88.com/api/v3/goods/detail",
+                json={
+                    **params,
+                    "keyword": "",
+                    "usageScene": 5,
+                },
+                headers=HEADERS,
+            )
+            return await resp.json(encoding="utf-8-sig") or {}
+
+        data = await retry_async(_request_detail)
         detail = data.get("data") or {}
-        
-        resp = await SESSION.post(
-            "https://msapi.maishou88.com/api/v1/share/getTargetUrl",
-            json={
-                **params,
-                "isDirectDetail": 0,
-            },
-            headers=HEADERS,
-        )
-        data = await resp.json(encoding="utf-8-sig") or {}
+
+        async def _request_url():
+            resp = await SESSION.post(
+                "https://msapi.maishou88.com/api/v1/share/getTargetUrl",
+                json={
+                    **params,
+                    "isDirectDetail": 0,
+                },
+                headers=HEADERS,
+            )
+            return await resp.json(encoding="utf-8-sig") or {}
+
+        data = await retry_async(_request_url)
         info = data.get("data") or {}
         
         if not info:
@@ -764,6 +907,9 @@ async def list_monitors(args):
 
 async def check_single_price(monitor_id: int):
     """检查单个商品价格"""
+    config = load_config()
+    threshold = config["price_change_threshold"]
+
     monitors = list_monitors_sync()
     monitor = next((m for m in monitors if m["id"] == monitor_id), None)
     
@@ -791,8 +937,6 @@ async def check_single_price(monitor_id: int):
     is_change = False
     if last_price and last_price > 0:
         change_ratio = abs(current_price - last_price) / last_price
-        config = load_config()
-        threshold = config.get("price_change_threshold", 0.01)
         if change_ratio >= threshold:
             is_change = True
             record_price_point(monitor_id, current_price, detail["originalPrice"],
@@ -806,14 +950,13 @@ async def check_single_price(monitor_id: int):
         record_price_point(monitor_id, current_price, detail["originalPrice"],
                           detail.get("title", ""), detail.get("appUrl", ""), True)
     
-    # 检查价格变化
-    config = load_config()
+    # 检查价格变化（使用同一个阈值）
     change_notify = False
     change_msg = ""
     
     if last_price:
         change_pct = (current_price - last_price) / last_price
-        if abs(change_pct) >= config["price_change_threshold"]:
+        if abs(change_pct) >= threshold:
             change_notify = True
             direction = "📈" if change_pct > 0 else "📉"
             change_msg = f"{direction} 价格变化：¥{last_price} → ¥{current_price} ({change_pct:+.1%})"
@@ -1230,125 +1373,138 @@ async def cleanup(args):
 
 async def main():
     global SESSION
-    
+
+    import atexit
+
+    # 注册 atexit 清理：当进程因 sys.exit、未捕获异常等退出时兜底关闭资源
+    atexit.register(_shutdown)
+
     # 初始化数据库
     init_database()
-    
+
     connector = aiohttp.TCPConnector(ssl=SSL_CONTEXT)
-    async with aiohttp.ClientSession(headers=HEADERS, connector=connector) as SESSION:
-        parser = argparse.ArgumentParser(description="电商价格监控工具（优化版）")
-        parsers = parser.add_subparsers()
-        
-        # add 命令
-        add_parser = parsers.add_parser("add", help="添加监控商品")
-        add_parser.add_argument("--source", required=True, help="平台 1:淘宝 2:京东 3:拼多多 7:抖音 8:快手")
-        add_parser.add_argument("--id", required=True, help="商品 ID")
-        add_parser.add_argument("--name", help="商品名称/备注")
-        add_parser.add_argument("--target_price", help="目标价格")
-        add_parser.set_defaults(func=add_monitor)
-        
-        # list 命令
-        list_parser = parsers.add_parser("list", help="查看监控列表")
-        list_parser.set_defaults(func=list_monitors)
-        
-        # check 命令
-        check_parser = parsers.add_parser("check", help="检查价格")
-        check_parser.add_argument("--id", type=int, help="监控 ID")
-        check_parser.add_argument("--all", action="store_true", help="检查所有")
-        check_parser.set_defaults(func=check_all_prices)
-        
-        # remove 命令
-        remove_parser = parsers.add_parser("remove", help="删除监控")
-        remove_parser.add_argument("--id", required=True, help="监控 ID")
-        remove_parser.set_defaults(func=remove_monitor)
-        
-        # history 命令
-        history_parser = parsers.add_parser("history", help="查看价格历史")
-        history_parser.add_argument("--id", required=True, help="监控 ID")
-        history_parser.set_defaults(func=show_history)
-        
-        # search 命令
-        search_parser = parsers.add_parser("search", help="搜索商品并批量添加监控")
-        search_parser.add_argument("--keyword", required=True, help="搜索关键词")
-        search_parser.add_argument("--source", required=True, help="平台 1:淘宝 2:京东 3:拼多多 7:抖音 8:快手")
-        search_parser.add_argument("--target_price", help="目标价格")
-        search_parser.add_argument("--group", help="分组名称")
-        search_parser.add_argument("--limit", type=int, default=10, help="返回结果数量（默认 10）")
-        search_parser.set_defaults(func=search_and_monitor)
-        
-        # config 命令
-        config_parser = parsers.add_parser("config", help="配置参数")
-        config_parser.add_argument("--interval", type=int, help="检查间隔 (分钟)")
-        config_parser.add_argument("--threshold", type=float, help="价格变化阈值 (0.05 表示 5%%)")
-        config_parser.add_argument("--cache-ttl", type=int, help="API 缓存时间 (秒)")
-        config_parser.set_defaults(func=config_monitor)
-        
-        # stats 命令
-        stats_parser = parsers.add_parser("stats", help="查看省钱统计")
-        stats_parser.set_defaults(func=show_stats)
-        
-        # cleanup 命令
-        cleanup_parser = parsers.add_parser("cleanup", help="清理旧数据和缓存")
-        cleanup_parser.set_defaults(func=cleanup)
-        
-        # low-price 命令
-        lowprice_parser = parsers.add_parser("low-price", help="查看历史低价商品排名")
-        lowprice_parser.add_argument("--top", type=int, default=10, help="显示数量（默认 10）")
-        lowprice_parser.add_argument("--days", type=int, default=30, help="查询天数（默认 30）")
-        lowprice_parser.set_defaults(func=show_low_price)
-        
-        # compare 命令
-        compare_parser = parsers.add_parser("compare", help="多源比价")
-        compare_parser.add_argument("--id", required=True, help="商品 ID")
-        compare_parser.add_argument("--sources", required=True, help="平台列表，逗号分隔 (如 1,2,3)")
-        compare_parser.set_defaults(func=compare_goods)
-        
-        # trend 命令
-        trend_parser = parsers.add_parser("trend", help="查看价格趋势图")
-        trend_parser.add_argument("--id", required=True, help="监控 ID")
-        trend_parser.add_argument("--days", type=int, default=30, help="查询天数（默认 30）")
-        trend_parser.set_defaults(func=show_trend)
-        
-        # group 命令
-        group_parser = parsers.add_parser("group", help="商品分组管理")
-        group_subparsers = group_parser.add_subparsers()
-        
-        group_add_parser = group_subparsers.add_parser("add", help="添加商品到分组")
-        group_add_parser.add_argument("--name", required=True, help="分组名称")
-        group_add_parser.add_argument("--id", required=True, help="监控 ID")
-        group_add_parser.set_defaults(func=group_add)
-        
-        group_remove_parser = group_subparsers.add_parser("remove", help="从分组中移除商品")
-        group_remove_parser.add_argument("--id", required=True, help="监控 ID")
-        group_remove_parser.set_defaults(func=group_remove)
-        
-        group_list_parser = group_subparsers.add_parser("list", help="列出所有分组")
-        group_list_parser.set_defaults(func=group_list)
-        
-        group_show_parser = group_subparsers.add_parser("show", help="查看指定分组")
-        group_show_parser.add_argument("--name", required=True, help="分组名称")
-        group_show_parser.set_defaults(func=group_show)
-        
-        group_delete_parser = group_subparsers.add_parser("delete", help="删除分组")
-        group_delete_parser.add_argument("--name", required=True, help="分组名称")
-        group_delete_parser.set_defaults(func=group_delete)
-        
-        # 让 group 主命令（无子命令时）默认调用 list
-        group_parser.set_defaults(func=group_list)
-        
-        # 将 group 子命令标记到 args
-        group_parser.set_defaults(group_cmd=None)
-        group_add_parser.set_defaults(group_cmd="add")
-        group_remove_parser.set_defaults(group_cmd="remove")
-        group_list_parser.set_defaults(group_cmd="list")
-        group_show_parser.set_defaults(group_cmd="show")
-        group_delete_parser.set_defaults(group_cmd="delete")
-        
-        args = parser.parse_args()
-        if hasattr(args, "func"):
-            await args.func(args)
-        else:
-            parser.print_help()
+    try:
+        async with aiohttp.ClientSession(headers=HEADERS, connector=connector) as SESSION:
+            parser = argparse.ArgumentParser(description="电商价格监控工具（优化版）")
+            parsers = parser.add_subparsers()
+
+            # add 命令
+            add_parser = parsers.add_parser("add", help="添加监控商品")
+            add_parser.add_argument("--source", required=True, help="平台 1:淘宝 2:京东 3:拼多多 7:抖音 8:快手")
+            add_parser.add_argument("--id", required=True, help="商品 ID")
+            add_parser.add_argument("--name", help="商品名称/备注")
+            add_parser.add_argument("--target_price", help="目标价格")
+            add_parser.set_defaults(func=add_monitor)
+
+            # list 命令
+            list_parser = parsers.add_parser("list", help="查看监控列表")
+            list_parser.set_defaults(func=list_monitors)
+
+            # check 命令
+            check_parser = parsers.add_parser("check", help="检查价格")
+            check_parser.add_argument("--id", type=int, help="监控 ID")
+            check_parser.add_argument("--all", action="store_true", help="检查所有")
+            check_parser.set_defaults(func=check_all_prices)
+
+            # remove 命令
+            remove_parser = parsers.add_parser("remove", help="删除监控")
+            remove_parser.add_argument("--id", required=True, help="监控 ID")
+            remove_parser.set_defaults(func=remove_monitor)
+
+            # history 命令
+            history_parser = parsers.add_parser("history", help="查看价格历史")
+            history_parser.add_argument("--id", required=True, help="监控 ID")
+            history_parser.set_defaults(func=show_history)
+
+            # search 命令
+            search_parser = parsers.add_parser("search", help="搜索商品并批量添加监控")
+            search_parser.add_argument("--keyword", required=True, help="搜索关键词")
+            search_parser.add_argument("--source", required=True, help="平台 1:淘宝 2:京东 3:拼多多 7:抖音 8:快手")
+            search_parser.add_argument("--target_price", help="目标价格")
+            search_parser.add_argument("--group", help="分组名称")
+            search_parser.add_argument("--limit", type=int, default=10, help="返回结果数量（默认 10）")
+            search_parser.set_defaults(func=search_and_monitor)
+
+            # config 命令
+            config_parser = parsers.add_parser("config", help="配置参数")
+            config_parser.add_argument("--interval", type=int, help="检查间隔 (分钟)")
+            config_parser.add_argument("--threshold", type=float, help="价格变化阈值 (0.05 表示 5%%)")
+            config_parser.add_argument("--cache-ttl", type=int, help="API 缓存时间 (秒)")
+            config_parser.set_defaults(func=config_monitor)
+
+            # stats 命令
+            stats_parser = parsers.add_parser("stats", help="查看省钱统计")
+            stats_parser.set_defaults(func=show_stats)
+
+            # cleanup 命令
+            cleanup_parser = parsers.add_parser("cleanup", help="清理旧数据和缓存")
+            cleanup_parser.set_defaults(func=cleanup)
+
+            # low-price 命令
+            lowprice_parser = parsers.add_parser("low-price", help="查看历史低价商品排名")
+            lowprice_parser.add_argument("--top", type=int, default=10, help="显示数量（默认 10）")
+            lowprice_parser.add_argument("--days", type=int, default=30, help="查询天数（默认 30）")
+            lowprice_parser.set_defaults(func=show_low_price)
+
+            # compare 命令
+            compare_parser = parsers.add_parser("compare", help="多源比价")
+            compare_parser.add_argument("--id", required=True, help="商品 ID")
+            compare_parser.add_argument("--sources", required=True, help="平台列表，逗号分隔 (如 1,2,3)")
+            compare_parser.set_defaults(func=compare_goods)
+
+            # trend 命令
+            trend_parser = parsers.add_parser("trend", help="查看价格趋势图")
+            trend_parser.add_argument("--id", required=True, help="监控 ID")
+            trend_parser.add_argument("--days", type=int, default=30, help="查询天数（默认 30）")
+            trend_parser.set_defaults(func=show_trend)
+
+            # group 命令
+            group_parser = parsers.add_parser("group", help="商品分组管理")
+            group_subparsers = group_parser.add_subparsers()
+
+            group_add_parser = group_subparsers.add_parser("add", help="添加商品到分组")
+            group_add_parser.add_argument("--name", required=True, help="分组名称")
+            group_add_parser.add_argument("--id", required=True, help="监控 ID")
+            group_add_parser.set_defaults(func=group_add)
+
+            group_remove_parser = group_subparsers.add_parser("remove", help="从分组中移除商品")
+            group_remove_parser.add_argument("--id", required=True, help="监控 ID")
+            group_remove_parser.set_defaults(func=group_remove)
+
+            group_list_parser = group_subparsers.add_parser("list", help="列出所有分组")
+            group_list_parser.set_defaults(func=group_list)
+
+            group_show_parser = group_subparsers.add_parser("show", help="查看指定分组")
+            group_show_parser.add_argument("--name", required=True, help="分组名称")
+            group_show_parser.set_defaults(func=group_show)
+
+            group_delete_parser = group_subparsers.add_parser("delete", help="删除分组")
+            group_delete_parser.add_argument("--name", required=True, help="分组名称")
+            group_delete_parser.set_defaults(func=group_delete)
+
+            # 让 group 主命令（无子命令时）默认调用 list
+            group_parser.set_defaults(func=group_list)
+
+            # 将 group 子命令标记到 args
+            group_parser.set_defaults(group_cmd=None)
+            group_add_parser.set_defaults(group_cmd="add")
+            group_remove_parser.set_defaults(group_cmd="remove")
+            group_list_parser.set_defaults(group_cmd="list")
+            group_show_parser.set_defaults(group_cmd="show")
+            group_delete_parser.set_defaults(group_cmd="delete")
+
+            args = parser.parse_args()
+            if hasattr(args, "func"):
+                await args.func(args)
+            else:
+                parser.print_help()
+    finally:
+        # 确保退出时 DB_CONN 始终关闭（sync 连接不受 async with 管理）
+        if DB_CONN is not None:
+            try:
+                DB_CONN.close()
+            except Exception as e:
+                logger.warning("关闭数据库连接失败: %s", e)
 
 
 if __name__ == "__main__":

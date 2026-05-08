@@ -38,7 +38,21 @@
 
 ## 🚀 快速开始
 
-### 1️⃣ 安装
+### 1️⃣ 配置邀请码
+
+首次使用前需要设置买手 API 邀请码：
+
+```bash
+# 复制示例配置
+cp .env.example .env
+
+# 编辑 .env 文件，填入你的邀请码
+# MAISHOU_INVITE_CODE=你的邀请码
+```
+
+> **注意**：未设置 `MAISHOU_INVITE_CODE` 环境变量时，程序将拒绝启动并提示错误。
+
+### 2️⃣ 安装
 
 ```bash
 # 通过 ClawHub（推荐）
@@ -49,7 +63,7 @@ git clone https://github.com/Kumagt/price-monitor.git
 mv price-monitor ~/.openclaw/workspace/skills/
 ```
 
-### 2️⃣ 添加监控
+### 3️⃣ 添加监控
 
 ```bash
 cd ~/.openclaw/workspace/skills/price-monitor
@@ -74,7 +88,7 @@ uv run scripts/main.py add --source=1 --id=12345678 --name="iPhone 16" --target_
 - **拼多多**：商品链接中的 `goods_id=xxx`
 - **抖音/快手**：商品链接中的数字 ID
 
-### 3️⃣ 查看监控列表
+### 4️⃣ 查看监控列表
 
 ```bash
 uv run scripts/main.py list
@@ -90,7 +104,7 @@ ID   名称                 平台     当前价      目标价      状态
 2    小米耳机            京东     ¥299       -          ✅      
 ```
 
-### 4️⃣ 检查价格
+### 5️⃣ 检查价格
 
 ```bash
 # 检查指定商品
@@ -100,7 +114,7 @@ uv run scripts/main.py check --id=1
 uv run scripts/main.py check --all
 ```
 
-### 5️⃣ 查看省钱统计
+### 6️⃣ 查看省钱统计
 
 ```bash
 uv run scripts/main.py stats
@@ -124,7 +138,7 @@ iPhone 16                ¥5999      ¥5299      ¥700      ✅
 💡 继续监控，省更多！
 ```
 
-### 6️⃣ 查看价格历史
+### 7️⃣ 查看价格历史
 
 ```bash
 uv run scripts/main.py history --id=1
@@ -142,7 +156,7 @@ uv run scripts/main.py history --id=1
 2026-03-16 13:00    ¥5499     Apple iPhone 16 128GB
 ```
 
-### 7️⃣ 清理旧数据
+### 8️⃣ 清理旧数据
 
 ```bash
 uv run scripts/main.py cleanup
