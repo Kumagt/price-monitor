@@ -126,6 +126,131 @@ async def retry_async(coro_fn, max_retries: int = 3, backoff: float = 1.0):
                 print(f"❌ 网络请求失败,已重试 {max_retries} 次,放弃({type(e).__name__}: {e})")
                 raise
 
+# ---------- 价格预测 ----------
+
+
+def linear_regression(x, y):
+    """纯 Python 线性回归，返回 slope, intercept, r_squared。"""
+    n = len(x)
+    sum_x = sum(x)
+    sum_y = sum(y)
+    sum_xy = sum(xi * yi for xi, yi in zip(x, y))
+    sum_x2 = sum(xi ** 2 for xi in x)
+    sum_y2 = sum(yi ** 2 for yi in y)
+
+    denom = n * sum_x2 - sum_x ** 2
+    if denom == 0:
+        return 0, sum_y / n, 0
+
+    slope = (n * sum_xy - sum_x * sum_y) / denom
+    intercept = (sum_y - slope * sum_x) / n
+
+    ss_res = sum((yi - (slope * xi + intercept)) ** 2 for xi, yi in zip(x, y))
+    ss_tot = sum((yi - sum_y / n) ** 2 for yi in y)
+    r_squared = 1 - ss_res / ss_tot if ss_tot != 0 else 0
+
+    return slope, intercept, r_squared
+
+
+async def predict_price(args):
+    """价格预测：基于历史数据进行线性回归预测。"""
+    monitor_id = int(args.id)
+    days = args.days if args.days else 30
+
+    conn = get_db()
+
+    # 获取监控信息
+    cursor = conn.execute("SELECT name, goods_id FROM monitors WHERE id = ?", (monitor_id,))
+    row = cursor.fetchone()
+    if not row:
+        print(f"❌ 未找到监控 #{monitor_id}")
+        return
+    name = row["name"]
+
+    # 查询最近 N 天的价格历史
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    cursor = conn.execute(
+        """SELECT price, timestamp FROM price_history
+           WHERE monitor_id = ? AND is_change_point = 1
+           AND timestamp > ?
+           ORDER BY timestamp ASC""",
+        (monitor_id, cutoff)
+    )
+    records = [dict(r) for r in cursor.fetchall()]
+
+    if len(records) < 3:
+        print(f"📭 {name} 最近 {days} 天内仅有 {len(records)} 个数据点，不足以进行预测（至少需要 3 个）。")
+        print("💡 建议：添加更多价格历史数据后再试。")
+        return
+
+    print(f"📈 价格预测 - {name}")
+    print(f"")
+    print(f"📊 基于最近 {days} 天的价格历史（共 {len(records)} 个数据点）")
+    print("")
+
+    # 打印历史价格
+    print("历史价格趋势：")
+    for r in records:
+        ts = r["timestamp"][:10].replace("T", "")
+        print(f"  {ts}  ¥{r['price']:.0f}")
+    print("")
+
+    # 构建回归数据：x = 距第一个数据点的天数, y = 价格
+    base_time = datetime.fromisoformat(records[0]["timestamp"])
+    x_vals = []
+    y_vals = []
+    for r in records:
+        t = datetime.fromisoformat(r["timestamp"])
+        day_offset = (t - base_time).total_seconds() / 86400.0
+        x_vals.append(day_offset)
+        y_vals.append(r["price"])
+
+    slope, intercept, r_squared = linear_regression(x_vals, y_vals)
+
+    # 输出回归结果
+    print(f"📈 线性回归结果：")
+    print(f"  斜率：{slope:+.2f} 元/天")
+    print(f"  R² 值：{r_squared:.2f}")
+    print("")
+
+    # 预测未来 7 天
+    forecast_days = 7
+    last_day_offset = x_vals[-1]
+
+    print(f"📅 未来 {forecast_days} 天预测：")
+    predictions = []
+    for i in range(1, forecast_days + 1):
+        future_x = last_day_offset + i
+        predicted_price = slope * future_x + intercept
+        predicted_price = max(0, predicted_price)  # 价格不能为负
+        predictions.append(predicted_price)
+        print(f"  Day {i}: ¥{predicted_price:.0f}")
+    print("")
+
+    # 趋势判断
+    print("📊 趋势判断：")
+    if abs(slope) < 1:
+        trend_dir = "↔️ 平稳"
+        suggestion = "价格基本稳定，可按需购买"
+    elif slope < 0:
+        trend_dir = "📉 下降趋势"
+        suggestion = f"价格持续下降，建议等待"
+    else:
+        trend_dir = "📈 上涨趋势"
+        suggestion = f"价格持续上涨，建议尽早入手"
+
+    print(f"  方向：{trend_dir}")
+    print(f"  建议：{suggestion}")
+
+    # R² 质量提示
+    if r_squared < 0.5:
+        print(f"")
+        print(f"⚠️ 提示：R² = {r_squared:.2f} 较低，预测结果仅供参考（数据波动较大）。")
+    elif r_squared < 0.8:
+        print(f"")
+        print(f"💡 提示：R² = {r_squared:.2f} 中等，预测结果有一定参考价值。")
+
+
 # ---------- 网络重试工具 ----------
 # 仅对网络层异常(连接失败、超时、DNS 等)进行重试
 # 业务异常(HTTP 错误响应、JSON 解析失败等)不重试
@@ -1698,6 +1823,235 @@ async def group_delete(args):
     print(f"✅ 已删除分组 '{args.name}',商品已移到未分组")
 
 
+async def export_history(args):
+    """导出价格历史为 CSV/Excel"""
+    monitor_id = getattr(args, "id", None)
+    export_all = getattr(args, "all", False)
+    fmt = getattr(args, "format", "csv").lower()
+    days = getattr(args, "days", 90)
+    output_dir = getattr(args, "output", None)
+
+    if monitor_id and export_all:
+        print("❌ --id 和 --all 互斥,请使用其中一个")
+        return
+    if not monitor_id and not export_all:
+        print("❌ 请指定 --id=监控ID 或 --all")
+        return
+
+    if output_dir:
+        out_dir = Path(output_dir)
+        if not out_dir.is_absolute():
+            out_dir = EXPORTS_DIR / out_dir
+    else:
+        out_dir = EXPORTS_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if fmt == "xlsx":
+        try:
+            import openpyxl
+            use_xlsx = True
+        except ImportError:
+            print("⚠️ openpyxl 未安装,降级为 CSV 格式")
+            print("   安装方法: pip install openpyxl")
+            fmt = "csv"
+            use_xlsx = False
+    else:
+        use_xlsx = False
+
+    if export_all:
+        await _export_all_history(fmt, days, out_dir, use_xlsx)
+    else:
+        await _export_single_history(int(monitor_id), fmt, days, out_dir, use_xlsx)
+
+
+async def _export_single_history(monitor_id: int, fmt: str, days: int, out_dir: Path, use_xlsx: bool):
+    """导出单个商品的价格历史"""
+    conn = get_db()
+
+    # 获取商品名称
+    cursor = conn.execute("SELECT name, goods_id, source FROM monitors WHERE id = ?", (monitor_id,))
+    row = cursor.fetchone()
+    if not row:
+        print(f"❌ 未找到监控 #{monitor_id}")
+        return
+    name = row["name"] or f"商品{row['goods_id']}"
+    goods_id = row["goods_id"]
+    source_name = _source_to_name(row["source"])
+
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+
+    # 查询价格历史
+    cursor = conn.execute(
+        """SELECT price, original_price, title, url, timestamp, is_change_point
+           FROM price_history
+           WHERE monitor_id = ? AND timestamp > ?
+           ORDER BY timestamp ASC""",
+        (monitor_id, cutoff)
+    )
+    records = [dict(r) for r in cursor.fetchall()]
+
+    # 输出统计
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    print(f"📊 导出价格历史 - {name}")
+    print(f"📅 时间范围：最近 {days} 天")
+    print(f"📄 导出格式：{fmt.upper()}")
+    print()
+
+    if not records:
+        print(f"📭 {name} 近 {days} 天内无价格记录")
+        return
+
+    if use_xlsx:
+        ext = "xlsx"
+        out_path = out_dir / f"history_{goods_id}_{date_str}.{ext}"
+        _write_xlsx_single(out_path, records, source_name)
+    else:
+        ext = "csv"
+        out_path = out_dir / f"history_{goods_id}_{date_str}.{ext}"
+        _write_csv_single(out_path, records, source_name)
+
+    file_size = out_path.stat().st_size
+    size_str = f"{file_size / 1024:.1f} KB" if file_size >= 1024 else f"{file_size} B"
+    change_count = sum(1 for r in records if r.get("is_change_point", 1))
+    print(f"✅ 已导出 {len(records)} 条价格记录（含 {change_count} 个变化点）")
+    print(f"📁 文件：{out_path}")
+    print(f"📦 文件大小：{size_str}")
+
+
+async def _export_all_history(fmt: str, days: int, out_dir: Path, use_xlsx: bool):
+    """导出所有商品的价格历史"""
+    conn = get_db()
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+
+    monitors = conn.execute("SELECT * FROM monitors WHERE enabled = 1 ORDER BY id").fetchall()
+    if not monitors:
+        print("📭 暂无启用的监控商品")
+        return
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    print(f"📊 导出全部价格历史")
+    print(f"📅 时间范围：最近 {days} 天")
+    print(f"📄 导出格式：{fmt.upper()}")
+    print(f"📦 共 {len(monitors)} 个商品")
+    print()
+
+    summary_rows = []
+    total_records = 0
+
+    for m in monitors:
+        mid = m["id"]
+        goods_id = m["goods_id"]
+        name = m["name"] or f"商品{goods_id}"
+        source_name = _source_to_name(m["source"])
+
+        cursor = conn.execute(
+            """SELECT price, original_price, title, url, timestamp, is_change_point
+               FROM price_history
+               WHERE monitor_id = ? AND timestamp > ?
+               ORDER BY timestamp ASC""",
+            (mid, cutoff)
+        )
+        records = [dict(r) for r in cursor.fetchall()]
+
+        # 汇总信息：最新价格
+        if records:
+            latest = records[-1]
+            summary_rows.append({
+                "ID": mid,
+                "商品ID": goods_id,
+                "名称": name,
+                "平台": source_name,
+                "最新价格": latest["price"],
+                "原价": latest.get("original_price") or "",
+                "记录数": len(records),
+                "最新时间": latest["timestamp"].replace("T", " ")[:19],
+            })
+        else:
+            summary_rows.append({
+                "ID": mid,
+                "商品ID": goods_id,
+                "名称": name,
+                "平台": source_name,
+                "最新价格": m.get("last_price") or "",
+                "原价": "",
+                "记录数": 0,
+                "最新时间": "",
+            })
+
+        if not records:
+            continue
+
+        # 每个商品一个文件
+        if use_xlsx:
+            ext = "xlsx"
+            out_path = out_dir / f"history_{goods_id}_{date_str}.{ext}"
+            _write_xlsx_single(out_path, records, source_name)
+        else:
+            ext = "csv"
+            out_path = out_dir / f"history_{goods_id}_{date_str}.{ext}"
+            _write_csv_single(out_path, records, source_name)
+
+        total_records += len(records)
+        print(f"  ✅ {name}: {len(records)} 条记录")
+
+    # 生成汇总文件（始终用 CSV，简单可靠）
+    summary_path = out_dir / f"summary_{date_str}.csv"
+    _write_csv_summary(summary_path, summary_rows)
+
+    summary_size = summary_path.stat().st_size
+    summary_size_str = f"{summary_size / 1024:.1f} KB" if summary_size >= 1024 else f"{summary_size} B"
+    print(f"\n✅ 总计：{total_records} 条价格记录")
+    print(f"📁 汇总文件：{summary_path}")
+    print(f"📦 汇总文件大小：{summary_size_str}")
+
+
+def _write_csv_single(out_path: Path, records: List[Dict], source_name: str):
+    """写入单个商品的 CSV 文件"""
+    with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["日期", "价格", "原价", "商品名", "平台", "URL", "是否变化点"])
+        for r in records:
+            writer.writerow([
+                r["timestamp"].replace("T", " ")[:19],
+                r["price"],
+                r.get("original_price") or "",
+                r.get("title") or "",
+                source_name,
+                r.get("url") or "",
+                "是" if r.get("is_change_point", 1) else "否",
+            ])
+
+
+def _write_xlsx_single(out_path: Path, records: List[Dict], source_name: str):
+    """写入单个商品的 Excel 文件"""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "价格历史"
+    ws.append(["日期", "价格", "原价", "商品名", "平台", "URL", "是否变化点"])
+    for r in records:
+        ws.append([
+            r["timestamp"].replace("T", " ")[:19],
+            r["price"],
+            r.get("original_price") or "",
+            r.get("title") or "",
+            source_name,
+            r.get("url") or "",
+            "是" if r.get("is_change_point", 1) else "否",
+        ])
+    wb.save(str(out_path))
+
+
+def _write_csv_summary(out_path: Path, rows: List[Dict]):
+    """写入汇总 CSV 文件"""
+    summary_cols = ["ID", "商品ID", "名称", "平台", "最新价格", "原价", "记录数", "最新时间"]
+    with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=summary_cols)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 async def cleanup(args):
     """清理旧数据和缓存"""
     config = load_config()
@@ -2043,6 +2397,12 @@ async def main():
             trend_parser.add_argument("--days", type=int, default=30, help="查询天数(默认 30)")
             trend_parser.set_defaults(func=show_trend)
 
+            # predict 命令
+            predict_parser = parsers.add_parser("predict", help="价格预测（线性回归）")
+            predict_parser.add_argument("--id", required=True, type=int, help="监控 ID")
+            predict_parser.add_argument("--days", type=int, default=30, help="使用最近 N 天数据(默认 30)")
+            predict_parser.set_defaults(func=predict_price)
+
             # group 命令
             group_parser = parsers.add_parser("group", help="商品分组管理")
             group_subparsers = group_parser.add_subparsers()
@@ -2091,6 +2451,18 @@ async def main():
             import_parser.add_argument("--overwrite", action="store_true",
                                        help="覆盖已存在的商品(默认跳过已有)")
             import_parser.set_defaults(func=import_monitors)
+
+            # export-history 命令
+            export_history_parser = parsers.add_parser("export-history", help="导出价格历史")
+            export_history_parser.add_argument("--id", help="监控 ID（与 --all 互斥）")
+            export_history_parser.add_argument("--all", action="store_true", dest="all",
+                                               help="导出所有商品")
+            export_history_parser.add_argument("--format", default="csv", choices=["csv", "xlsx"],
+                                               help="导出格式:csv 或 xlsx（默认 csv）")
+            export_history_parser.add_argument("--days", type=int, default=90,
+                                               help="导出最近 N 天的数据（默认 90）")
+            export_history_parser.add_argument("--output", help="指定输出目录（默认 data/exports/）")
+            export_history_parser.set_defaults(func=export_history)
 
             args = parser.parse_args()
             if hasattr(args, "func"):
