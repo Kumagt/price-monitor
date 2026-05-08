@@ -1,4 +1,4 @@
-﻿# 电商价格监控助手 v2.2.0
+﻿# 电商价格监控助手 v2.3.0
 
 > **重大更新** - 修复所有严重 Bug，引入重试机制、原子写入、日志框架  
 > 跟踪商品价格变化，设置降价提醒，自动推送优惠信息  
@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![OpenClaw Skill](https://img.shields.io/badge/OpenClaw-Skill-green.svg)](https://openclaw.ai)
-[![Version](https://img.shields.io/badge/version-2.2.0-red.svg)](https://github.com/Kumagt/price-monitor/releases)
+[![Version](https://img.shields.io/badge/version-2.3.0-red.svg)](https://github.com/Kumagt/price-monitor/releases)
 
 ---
 
@@ -116,6 +116,28 @@ uv run scripts/main.py config --cache-ttl=600
 
 # 查看当前配置
 uv run scripts/main.py config
+```
+
+---
+
+## v2.3.0 更新内容
+
+### 新功能
+- **Web UI**：零依赖内嵌页面，仪表盘/价格趋势图/添加删除商品/配置修改
+- **REST API 服务器**：完整 REST API，支持认证 Token，供外部系统集成
+- **平台扩展框架**：新增小红书/得物/唯品会/美团/饿了么适配器（待接入真实 API）
+
+### Web UI 使用
+```bash
+uv run scripts/main.py webui              # 默认 http://127.0.0.1:8765
+uv run scripts/main.py webui --port 8080  # 自定义端口
+uv run scripts/main.py webui --host 0.0.0.0  # 局域网访问
+```
+
+### REST API 使用
+```bash
+uv run scripts/main.py api-server              # 默认 http://127.0.0.1:8766
+uv run scripts/main.py api-server --token YOUR_TOKEN  # 启用认证
 ```
 
 ---

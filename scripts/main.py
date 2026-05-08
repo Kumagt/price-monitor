@@ -41,12 +41,8 @@ DATA_DIR.mkdir(exist_ok=True)
 EXPORTS_DIR = DATA_DIR / "exports"
 EXPORTS_DIR.mkdir(exist_ok=True)
 
-# 买手 API 配置
-_INVITE_CODE_ENV = os.getenv("MAISHOU_INVITE_CODE")
-if not _INVITE_CODE_ENV:
-    print("错误:未设置环境变量 MAISHOU_INVITE_CODE")
-    print("    请设置后重新运行,参考 .env.example 文件")
-    sys.exit(1)
+# 买手 API 配置(可选)
+_INVITE_CODE_ENV = os.getenv("MAISHOU_INVITE_CODE", "")
 INVITE_CODE = _INVITE_CODE_ENV
 HEADERS = {
     aiohttp.hdrs.ACCEPT: "application/json",
@@ -379,6 +375,7 @@ def load_config():
         "max_history_per_item": 100,
         "anomaly_threshold": 0.3,       # 30% 异常波动阈值
         "anomaly_trend_count": 3,       # 连续趋势检测次数
+        "invite_code": "",              # 买手 API 邀请码(可选)
         # 通知渠道配置
         "notify_channel": "json",  # json/webhook/email/all(逗号分隔)
         "notify_webhook_url": "",
@@ -805,14 +802,23 @@ async def search_goods(keyword: str, source: int, limit: int = 10) -> List[Dict]
         print(f"⚡ 使用缓存:搜索 \"{keyword}\"")
         return cache[cache_key]["data"]
 
+    # 获取邀请码：环境变量 > config.json > 空字符串
+    config = load_config()
+    invite_code = INVITE_CODE or config.get("invite_code", "")
+
     try:
+        if not invite_code:
+            print("⚠️ 未设置邀请码，API 调用可能失败。请通过以下方式之一设置：")
+            print("   1. 环境变量: MAISHOU_INVITE_CODE=你的邀请码")
+            print("   2. 配置文件: uv run scripts/main.py config --invite-code=你的邀请码")
+
         async def _request():
             resp = await SESSION.post(
                 "https://appapi.maishou88.com/api/v3/goods/list",
                 json={
                     "keyword": keyword,
                     "sourceType": str(source),
-                    "inviteCode": INVITE_CODE,
+                    "inviteCode": invite_code,
                     "supplierCode": "",
                     "activityId": "",
                     "usageScene": 5,
@@ -879,15 +885,23 @@ async def get_goods_detail(goods_id: str, source: int) -> Optional[Dict]:
     cache = load_api_cache()
     config = load_config()
 
+    # 获取邀请码：环境变量 > config.json > 空字符串
+    invite_code = INVITE_CODE or config.get("invite_code", "")
+
     # 检查缓存
     if is_cache_valid(cache, cache_key, config.get("cache_ttl_seconds", CACHE_TTL_SECONDS)):
         print(f"⚡ 使用缓存:商品 {goods_id}")
         return cache[cache_key]["data"]
 
+    if not invite_code:
+        print("⚠️ 未设置邀请码，API 调用可能失败。请通过以下方式之一设置：")
+        print("   1. 环境变量: MAISHOU_INVITE_CODE=你的邀请码")
+        print("   2. 配置文件: uv run scripts/main.py config --invite-code=你的邀请码")
+
     params = {
         "goodsId": str(goods_id),
         "sourceType": str(source),
-        "inviteCode": INVITE_CODE,
+        "inviteCode": invite_code,
         "supplierCode": "",
         "activityId": "",
         "isShare": "1",
@@ -952,7 +966,102 @@ async def get_goods_detail(goods_id: str, source: int) -> Optional[Dict]:
 
 
 # 平台名称映射
-SOURCE_NAMES = {1: "淘宝", 2: "京东", 3: "拼多多", 7: "抖音", 8: "快手"}
+SOURCE_NAMES = {
+    1: "淘宝", 2: "京东", 3: "拼多多",
+    4: "小红书", 5: "得物", 6: "唯品会",
+    7: "抖音", 8: "快手",
+    9: "美团", 10: "饿了么",
+}
+
+
+# ──────────────── 平台适配器框架 ────────────────
+
+class PlatformAdapter:
+    """平台适配器基类"""
+    platform_id: int = None
+    platform_name: str = None
+
+    async def get_price(self, session: aiohttp.ClientSession, goods_id: str) -> Optional[Dict]:
+        """获取商品价格（子类实现）"""
+        raise NotImplementedError
+
+    async def search_goods(self, session: aiohttp.ClientSession, keyword: str, **kwargs) -> List[Dict]:
+        """搜索商品（子类实现）"""
+        raise NotImplementedError
+
+
+PLATFORM_REGISTRY: Dict[int, PlatformAdapter] = {}
+
+
+def register_platform(adapter_class):
+    """注册平台适配器装饰器"""
+    PLATFORM_REGISTRY[adapter_class.platform_id] = adapter_class()
+    return adapter_class
+
+
+@register_platform
+class XiaohongshuAdapter(PlatformAdapter):
+    """小红书平台适配器（待接入）"""
+    platform_id = 4
+    platform_name = "小红书"
+
+    async def get_price(self, session, goods_id):
+        return {"status": "pending", "message": f"{self.platform_name} API 待接入", "goods_id": goods_id}
+
+    async def search_goods(self, session, keyword, **kwargs):
+        return [{"status": "pending", "message": f"{self.platform_name} 搜索待接入", "keyword": keyword}]
+
+
+@register_platform
+class DewuAdapter(PlatformAdapter):
+    """得物平台适配器（待接入）"""
+    platform_id = 5
+    platform_name = "得物"
+
+    async def get_price(self, session, goods_id):
+        return {"status": "pending", "message": f"{self.platform_name} API 待接入", "goods_id": goods_id}
+
+    async def search_goods(self, session, keyword, **kwargs):
+        return [{"status": "pending", "message": f"{self.platform_name} 搜索待接入", "keyword": keyword}]
+
+
+@register_platform
+class VipshopAdapter(PlatformAdapter):
+    """唯品会平台适配器（待接入）"""
+    platform_id = 6
+    platform_name = "唯品会"
+
+    async def get_price(self, session, goods_id):
+        return {"status": "pending", "message": f"{self.platform_name} API 待接入", "goods_id": goods_id}
+
+    async def search_goods(self, session, keyword, **kwargs):
+        return [{"status": "pending", "message": f"{self.platform_name} 搜索待接入", "keyword": keyword}]
+
+
+@register_platform
+class MeituanAdapter(PlatformAdapter):
+    """美团平台适配器（待接入）"""
+    platform_id = 9
+    platform_name = "美团"
+
+    async def get_price(self, session, goods_id):
+        return {"status": "pending", "message": f"{self.platform_name} API 待接入", "goods_id": goods_id}
+
+    async def search_goods(self, session, keyword, **kwargs):
+        return [{"status": "pending", "message": f"{self.platform_name} 搜索待接入", "keyword": keyword}]
+
+
+@register_platform
+class ElemeAdapter(PlatformAdapter):
+    """饿了么平台适配器（待接入）"""
+    platform_id = 10
+    platform_name = "饿了么"
+
+    async def get_price(self, session, goods_id):
+        return {"status": "pending", "message": f"{self.platform_name} API 待接入", "goods_id": goods_id}
+
+    async def search_goods(self, session, keyword, **kwargs):
+        return [{"status": "pending", "message": f"{self.platform_name} 搜索待接入", "keyword": keyword}]
 
 
 async def compare_goods(args):
@@ -1287,7 +1396,7 @@ async def list_monitors(args):
     print(f"{'ID':<4} {'名称':<20} {'平台':<8} {'当前价':<10} {'目标价':<10} {'状态':<8}")
     print("-" * 70)
 
-    source_names = {1: "淘宝", 2: "京东", 3: "拼多多", 7: "抖音", 8: "快手"}
+    source_names = SOURCE_NAMES
 
     for m in monitors:
         price_str = f"¥{m.get('last_price', 'N/A')}" if m.get('last_price') else "N/A"
@@ -1512,8 +1621,7 @@ async def search_and_monitor(args):
     group_name = args.group or ""
     limit = int(args.limit) if args.limit else 10
 
-    source_names = {1: "淘宝", 2: "京东", 3: "拼多多", 7: "抖音", 8: "快手"}
-    source_name = source_names.get(source, f"平台{source}")
+    source_name = SOURCE_NAMES.get(source, f"平台{source}")
 
     print(f"🔍 正在搜索 \"{keyword}\"({source_name})...\n")
 
@@ -1636,6 +1744,13 @@ async def config_monitor(args):
         config["anomaly_trend_count"] = int(args.anomaly_trend_count)
         print(f"✅ 连续趋势检测次数已设置为 {args.anomaly_trend_count} 次")
 
+    if args.invite_code is not None:
+        config["invite_code"] = args.invite_code
+        if args.invite_code:
+            print(f"✅ 邀请码已设置")
+        else:
+            print(f"✅ 邀请码已清除")
+
     save_config(config)
 
     print(f"\n当前配置:")
@@ -1656,6 +1771,11 @@ async def config_monitor(args):
         print(f"   邮箱密码：{'*' * 8}")
     print(f"   异常检测阈值：{config.get('anomaly_threshold', 0.3)*100:.0f}%")
     print(f"   连续趋势检测次数：{config.get('anomaly_trend_count', 3)} 次")
+    invite = config.get('invite_code', '')
+    if invite:
+        print(f"   邀请码：{invite[:4]}{'*' * (len(invite) - 4) if len(invite) > 4 else ''}")
+    else:
+        print(f"   邀请码：未设置")
 
 
 async def show_stats(args):
@@ -1803,7 +1923,7 @@ async def group_show(args):
     print(f"{'ID':<4} {'名称':<20} {'平台':<8} {'当前价':<10} {'目标价':<10}")
     print("-" * 60)
 
-    source_names = {1: "淘宝", 2: "京东", 3: "拼多多", 7: "抖音", 8: "快手"}
+    source_names = SOURCE_NAMES
 
     for m in group_monitors:
         price_str = f"¥{m.get('last_price', 'N/A')}" if m.get('last_price') else "N/A"
@@ -2302,6 +2422,558 @@ async def import_monitors(args):
     print(f"   来源:{in_path}")
 
 
+# ──────────────── Web UI ────────────────
+
+
+def _build_webui_html() -> str:
+    """生成 Web UI 主页面 HTML。"""
+    return """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Price Monitor - Web UI</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#333;min-height:100vh}
+.header{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;padding:20px 24px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.header h1{font-size:1.4rem;font-weight:600}
+.header .stats{margin-left:auto;font-size:.85rem;opacity:.9}
+.container{max-width:1200px;margin:0 auto;padding:16px}
+.filters{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:center}
+.filters select,.filters input{padding:8px 12px;border:1px solid #ddd;border-radius:8px;background:#fff;font-size:.9rem}
+.filters input{width:180px}
+.card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
+.card{background:#fff;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,.08);transition:transform .15s}
+.card:hover{transform:translateY(-2px);box-shadow:0 4px 16px rgba(0,0,0,.12)}
+.card-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px}
+.card-title{font-weight:600;font-size:1rem;line-height:1.3;flex:1;margin-right:8px}
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:.75rem;font-weight:500}
+.badge-normal{background:#e6f7ed;color:#27ae60}
+.badge-down{background:#fde8e8;color:#e74c3c}
+.badge-up{background:#fff3cd;color:#f39c12}
+.card-price{display:flex;align-items:baseline;gap:8px;margin-bottom:8px}
+.current-price{font-size:1.5rem;font-weight:700;color:#333}
+.original-price{font-size:.85rem;color:#999;text-decoration:line-through}
+.card-meta{display:flex;gap:8px;font-size:.8rem;color:#666;flex-wrap:wrap}
+.card-meta span{display:flex;align-items:center;gap:4px}
+.card-actions{margin-top:12px;display:flex;gap:8px}
+.btn{padding:6px 14px;border:none;border-radius:6px;cursor:pointer;font-size:.8rem;font-weight:500;transition:background .15s}
+.btn-sm{padding:4px 10px;font-size:.75rem}
+.btn-primary{background:#667eea;color:#fff}
+.btn-primary:hover{background:#5568d3}
+.btn-danger{background:#e74c3c;color:#fff}
+.btn-danger:hover{background:#c0392b}
+.btn-secondary{background:#e0e0e0;color:#333}
+.btn-secondary:hover{background:#ccc}
+.btn-success{background:#27ae60;color:#fff}
+.btn-success:hover{background:#219a52}
+.modal{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.5);z-index:100;align-items:center;justify-content:center}
+.modal.active{display:flex}
+.modal-content{background:#fff;border-radius:12px;padding:24px;max-width:500px;width:90%;max-height:90vh;overflow-y:auto}
+.modal-content h2{margin-bottom:16px;font-size:1.2rem}
+.form-group{margin-bottom:12px}
+.form-group label{display:block;margin-bottom:4px;font-size:.85rem;font-weight:500;color:#555}
+.form-group input,.form-group select{width:100%;padding:8px 12px;border:1px solid #ddd;border-radius:6px;font-size:.9rem}
+.form-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+.chart-container{position:relative;height:300px;margin:16px 0}
+.empty-state{text-align:center;padding:60px 20px;color:#999}
+.empty-state h2{margin-bottom:8px;color:#666}
+.config-section{background:#fff;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 2px 8px rgba(0,0,0,.08)}
+.config-section h3{margin-bottom:12px;font-size:1rem}
+.config-row{display:flex;align-items:center;gap:12px;margin-bottom:8px}
+.config-row label{min-width:180px;font-size:.85rem;color:#555}
+.config-row input{flex:1;max-width:300px;padding:6px 10px;border:1px solid #ddd;border-radius:6px;font-size:.85rem}
+.toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;color:#fff;font-size:.9rem;z-index:200;transform:translateY(100px);opacity:0;transition:all .3s}
+.toast.show{transform:translateY(0);opacity:1}
+.toast-success{background:#27ae60}
+.toast-error{background:#e74c3c}
+.tab-bar{display:flex;gap:4px;margin-bottom:16px;border-bottom:2px solid #eee}
+.tab{padding:10px 20px;cursor:pointer;font-size:.9rem;font-weight:500;color:#666;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .15s}
+.tab.active{color:#667eea;border-bottom-color:#667eea}
+.tab:hover{color:#333}
+.tab-content{display:none}
+.tab-content.active{display:block}
+@media(max-width:600px){.card-grid{grid-template-columns:1fr}.header{padding:16px}.header h1{font-size:1.1rem}.filters{flex-direction:column}.filters input,.filters select{width:100%}}
+</style>
+</head>
+<body>
+<div class="header">
+<h1>📊 Price Monitor</h1>
+<div class="stats" id="headerStats">加载中...</div>
+</div>
+<div class="container">
+<div class="tab-bar">
+<div class="tab active" data-tab="dashboard">仪表盘</div>
+<div class="tab" data-tab="add">添加商品</div>
+<div class="tab" data-tab="config">配置</div>
+</div>
+
+<div class="tab-content active" id="tab-dashboard">
+<div class="filters">
+<select id="filterPlatform" onchange="applyFilters()">
+<option value="">全部平台</option>
+<option value="1">淘宝</option>
+<option value="2">京东</option>
+<option value="3">拼多多</option>
+<option value="7">抖音</option>
+<option value="8">快手</option>
+</select>
+<select id="filterGroup" onchange="applyFilters()">
+<option value="">全部分组</option>
+</select>
+<input type="text" id="filterSearch" placeholder="🔍 搜索商品..." oninput="applyFilters()">
+<button class="btn btn-primary btn-sm" onclick="refreshMonitors()">🔄 刷新</button>
+</div>
+<div class="card-grid" id="cardGrid"></div>
+</div>
+
+<div class="tab-content" id="tab-add">
+<div class="config-section">
+<h2>添加监控商品</h2>
+<div class="form-group">
+<label>平台</label>
+<select id="addSource">
+<option value="1">淘宝</option>
+<option value="2">京东</option>
+<option value="3">拼多多</option>
+<option value="7">抖音</option>
+<option value="8">快手</option>
+</select>
+</div>
+<div class="form-group">
+<label>商品 ID</label>
+<input type="text" id="addGoodsId" placeholder="输入商品 ID">
+</div>
+<div class="form-group">
+<label>商品名称</label>
+<input type="text" id="addName" placeholder="输入商品名称">
+</div>
+<div class="form-group">
+<label>目标价格（可选）</label>
+<input type="number" id="addTargetPrice" placeholder="如：99.9">
+</div>
+<div class="form-group">
+<label>分组（可选）</label>
+<input type="text" id="addGroup" placeholder="如：电子产品">
+</div>
+<div class="form-actions">
+<button class="btn btn-secondary" onclick="clearAddForm()">清空</button>
+<button class="btn btn-success" onclick="addMonitor()">✅ 添加监控</button>
+</div>
+</div>
+</div>
+
+<div class="tab-content" id="tab-config">
+<div class="config-section" id="configForm"></div>
+</div>
+</div>
+
+<!-- 图表模态框 -->
+<div class="modal" id="chartModal">
+<div class="modal-content">
+<h2 id="chartTitle">价格趋势</h2>
+<div class="chart-container"><canvas id="priceChart"></canvas></div>
+<div class="form-actions">
+<button class="btn btn-secondary" onclick="closeChartModal()">关闭</button>
+</div>
+</div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const PLATFORM_NAMES={1:'淘宝',2:'京东',3:'拼多多',7:'抖音',8:'快手'};
+let allMonitors=[];
+let priceChart=null;
+
+// Tab 切换
+document.querySelectorAll('.tab').forEach(tab=>{
+  tab.addEventListener('click',()=>{
+    document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('tab-'+tab.dataset.tab).classList.add('active');
+  });
+});
+
+async function api(url,method='GET',body=null){
+  const opts={method,headers:{'Content-Type':'application/json'}};
+  if(body)opts.body=JSON.stringify(body);
+  const res=await fetch(url,opts);
+  if(!res.ok)throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+function showToast(msg,type='success'){
+  const t=document.getElementById('toast');
+  t.textContent=msg;t.className='toast toast-'+type+' show';
+  setTimeout(()=>t.classList.remove('show'),3000);
+}
+
+function getStatus(m){
+  if(!m.last_price)return{label:'未知',cls:'badge-normal'};
+  if(m.target_price&&m.last_price<=m.target_price)return{label:'🎉 达标',cls:'badge-down'};
+  const history=m.history||[];
+  if(history.length>=2){
+    const last=history[history.length-2]?.price||m.last_price;
+    if(m.last_price<last)return{label:'📉 降价',cls:'badge-down'};
+    if(m.last_price>last)return{label:'📈 涨价',cls:'badge-up'};
+  }
+  return{label:'✅ 正常',cls:'badge-normal'};
+}
+
+function renderCards(monitors){
+  const grid=document.getElementById('cardGrid');
+  if(!monitors.length){
+    grid.innerHTML='<div class="empty-state"><h2>暂无监控商品</h2><p>点击「添加商品」开始监控</p></div>';
+    return;
+  }
+  grid.innerHTML=monitors.map(m=>{
+    const status=getStatus(m);
+    const platform=PLATFORM_NAMES[m.source]||'未知';
+    const group=m.group_name?`<span>📁 ${m.group_name}</span>`:'';
+    const targetStr=m.target_price?`目标:¥${m.target_price}`:'';
+    return `<div class="card">
+      <div class="card-header">
+        <div class="card-title">${m.name||'商品'+m.goods_id}</div>
+        <span class="badge ${status.cls}">${status.label}</span>
+      </div>
+      <div class="card-price">
+        <span class="current-price">¥${m.last_price!=null?m.last_price.toFixed(0):'--'}</span>
+        ${targetStr?`<span style="font-size:.8rem;color:#667eea">${targetStr}</span>`:''}
+      </div>
+      <div class="card-meta">
+        <span>🏷️ ${platform}</span>
+        ${group}
+        <span>🕐 ${m.last_check?m.last_check.slice(0,16).replace('T',' '):'未检查'}</span>
+      </div>
+      <div class="card-actions">
+        <button class="btn btn-primary btn-sm" onclick="showChart(${m.id})">📈 趋势</button>
+        <button class="btn btn-danger btn-sm" onclick="removeMonitor(${m.id},'${(m.name||'').replace(/'/g,"\\'")}')">🗑️ 删除</button>
+      </div>
+    </div>`;
+  }).join('');
+  document.getElementById('headerStats').textContent=`共 ${monitors.length} 个商品`;
+}
+
+function applyFilters(){
+  const platform=document.getElementById('filterPlatform').value;
+  const group=document.getElementById('filterGroup').value;
+  const search=document.getElementById('filterSearch').value.toLowerCase();
+  let filtered=allMonitors;
+  if(platform)filtered=filtered.filter(m=>m.source==platform);
+  if(group)filtered=filtered.filter(m=>m.group_name===group);
+  if(search)filtered=filtered.filter(m=>(m.name||'').toLowerCase().includes(search));
+  renderCards(filtered);
+}
+
+async function refreshMonitors(){
+  try{
+    const data=await api('/api/monitors');
+    allMonitors=data.monitors||[];
+    // 更新分组筛选
+    const groups=new Set();
+    allMonitors.forEach(m=>{if(m.group_name)groups.add(m.group_name)});
+    const groupSel=document.getElementById('filterGroup');
+    groupSel.innerHTML='<option value="">全部分组</option>'+Array.from(groups).map(g=>`<option value="${g}">${g}</option>`).join('');
+    applyFilters();
+  }catch(e){showToast('刷新失败: '+e.message,'error')}
+}
+
+async function showChart(id){
+  const m=allMonitors.find(x=>x.id===id);
+  if(!m)return;
+  document.getElementById('chartTitle').textContent=m.name||'商品'+m.goods_id;
+  try{
+    const data=await api('/api/history/'+id);
+    const records=data.history||[];
+    const labels=records.map(r=>r.timestamp.slice(0,16).replace('T',' '));
+    const prices=records.map(r=>r.price);
+    const modal=document.getElementById('chartModal');
+    modal.classList.add('active');
+    if(priceChart)priceChart.destroy();
+    const ctx=document.getElementById('priceChart').getContext('2d');
+    priceChart=new Chart(ctx,{
+      type:'line',
+      data:{labels,datasets:[{label:'价格(¥)',data:prices,borderColor:'#667eea',backgroundColor:'rgba(102,126,234,0.1)',fill:true,tension:.3,pointRadius:3}]},
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:true}},scales:{y:{beginAtZero:false,title:{display:true,text:'价格(¥)'}}}}
+    });
+  }catch(e){showToast('加载趋势失败','error')}
+}
+
+function closeChartModal(){document.getElementById('chartModal').classList.remove('active')}
+
+async function addMonitor(){
+  const source=document.getElementById('addSource').value;
+  const goods_id=document.getElementById('addGoodsId').value.trim();
+  const name=document.getElementById('addName').value.trim();
+  const target_price=document.getElementById('addTargetPrice').value;
+  const group_name=document.getElementById('addGroup').value.trim();
+  if(!goods_id){showToast('请输入商品ID','error');return}
+  try{
+    await api('/api/add','POST',{source:+source,goods_id,name,target_price:target_price?+target_price:null,group_name});
+    showToast('添加成功!');
+    clearAddForm();
+    refreshMonitors();
+  }catch(e){showToast('添加失败: '+e.message,'error')}
+}
+
+function clearAddForm(){
+  ['addGoodsId','addName','addTargetPrice','addGroup'].forEach(id=>document.getElementById(id).value='');
+}
+
+async function removeMonitor(id,name){
+  if(!confirm(`确定删除「${name}」?`))return;
+  try{
+    await api('/api/remove/'+id,'DELETE');
+    showToast('已删除');
+    refreshMonitors();
+  }catch(e){showToast('删除失败','error')}
+}
+
+async function loadConfig(){
+  try{
+    const config=await api('/api/config');
+    const rows=[
+      ['检查间隔(分钟)','check_interval_minutes',config.check_interval_minutes,'number'],
+      ['价格变化阈值(%)','price_change_threshold',config.price_change_threshold*100,'number'],
+      ['自动通知','auto_notify',config.auto_notify?'开启':'关闭','text'],
+      ['API缓存(秒)','cache_ttl_seconds',config.cache_ttl_seconds,'number'],
+      ['通知渠道','notify_channel',config.notify_channel,'text'],
+      ['历史保留(天)','history_retention_days',config.history_retention_days,'number'],
+    ];
+    let html='<h3>⚙️ 当前配置</h3>';
+    rows.forEach(([label,key,val,type])=>{
+      if(type==='text')html+=`<div class="config-row"><label>${label}</label><span>${val}</span></div>`;
+      else html+=`<div class="config-row"><label>${label}</label><input type="${type}" id="cfg_${key}" value="${val}"></div>`;
+    });
+    html+='<div class="form-actions"><button class="btn btn-primary" onclick="saveConfig()">💾 保存配置</button></div>';
+    document.getElementById('configForm').innerHTML=html;
+  }catch(e){showToast('加载配置失败','error')}
+}
+
+async function saveConfig(){
+  const updates={
+    check_interval_minutes:+document.getElementById('cfg_check_interval_minutes').value,
+    price_change_threshold:+document.getElementById('cfg_price_change_threshold').value/100,
+    cache_ttl_seconds:+document.getElementById('cfg_cache_ttl_seconds').value,
+    history_retention_days:+document.getElementById('cfg_history_retention_days').value,
+  };
+  try{
+    await api('/api/config','POST',updates);
+    showToast('配置已保存');
+    loadConfig();
+  }catch(e){showToast('保存失败: '+e.message,'error')}
+}
+
+// 初始化
+refreshMonitors();
+loadConfig();
+document.getElementById('chartModal').addEventListener('click',e=>{if(e.target.id==='chartModal')closeChartModal()});
+</script>
+</body>
+</html>"""
+
+
+async def start_webui(args):
+    """启动 Web UI 服务器。"""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import threading
+
+    host = getattr(args, "host", "127.0.0.1")
+    port = getattr(args, "port", 8765)
+
+    html_page = _build_webui_html()
+
+    class WebUIHandler(BaseHTTPRequestHandler):
+        """Web UI HTTP 请求处理器。"""
+
+        def log_message(self, format, *args):
+            # 抑制默认日志输出
+            pass
+
+        def _send_json(self, data, status=200):
+            body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _read_body(self):
+            length = int(self.headers.get("Content-Length", 0))
+            if length > 0:
+                return json.loads(self.rfile.read(length).decode("utf-8"))
+            return {}
+
+        def do_GET(self):
+            path = self.path.split("?")[0]  # 忽略 query params
+
+            if path == "/" or path == "":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html_page.encode("utf-8"))))
+                self.end_headers()
+                self.wfile.write(html_page.encode("utf-8"))
+                return
+
+            if path == "/api/monitors":
+                try:
+                    monitors = list_monitors_sync()
+                    # 附加简单历史摘要
+                    conn = get_db()
+                    result = []
+                    for m in monitors:
+                        cursor = conn.execute(
+                            "SELECT price, timestamp FROM price_history "
+                            "WHERE monitor_id = ? ORDER BY timestamp ASC LIMIT 100",
+                            (m["id"],)
+                        )
+                        history = [dict(r) for r in cursor.fetchall()]
+                        m["history"] = history
+                        result.append(m)
+                    self._send_json({"monitors": result, "count": len(result)})
+                except Exception as e:
+                    self._send_json({"error": str(e)}, 500)
+                return
+
+            if path.startswith("/api/history/"):
+                try:
+                    mid = int(path.split("/")[-1])
+                    conn = get_db()
+                    cursor = conn.execute(
+                        "SELECT price, original_price, timestamp, is_change_point "
+                        "FROM price_history WHERE monitor_id = ? ORDER BY timestamp ASC",
+                        (mid,)
+                    )
+                    history = [dict(r) for r in cursor.fetchall()]
+                    self._send_json({"monitor_id": mid, "history": history, "count": len(history)})
+                except Exception as e:
+                    self._send_json({"error": str(e)}, 500)
+                return
+
+            if path == "/api/config":
+                try:
+                    config = load_config()
+                    self._send_json(config)
+                except Exception as e:
+                    self._send_json({"error": str(e)}, 500)
+                return
+
+            # 404
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"404 Not Found")
+
+        def do_POST(self):
+            path = self.path.split("?")[0]
+
+            if path == "/api/add":
+                try:
+                    body = self._read_body()
+                    goods_id = str(body.get("goods_id", "")).strip()
+                    source = int(body.get("source", 1))
+                    name = body.get("name", f"商品{goods_id}")
+                    target_price = body.get("target_price")
+                    group_name = body.get("group_name", "")
+
+                    if not goods_id:
+                        self._send_json({"error": "商品 ID 不能为空"}, 400)
+                        return
+
+                    mid = add_monitor_sync(goods_id, source, name, target_price, group_name)
+                    if mid == 0:
+                        self._send_json({"error": "该商品已在监控中"}, 409)
+                    else:
+                        self._send_json({"ok": True, "monitor_id": mid, "name": name})
+                except Exception as e:
+                    self._send_json({"error": str(e)}, 500)
+                return
+
+            if path == "/api/config":
+                try:
+                    body = self._read_body()
+                    config = load_config()
+                    for key in ("check_interval_minutes", "price_change_threshold",
+                                "cache_ttl_seconds", "history_retention_days",
+                                "request_delay_ms", "anomaly_threshold", "anomaly_trend_count",
+                                "notify_channel", "notify_webhook_url"):
+                        if key in body:
+                            config[key] = body[key]
+                    save_config(config)
+                    self._send_json({"ok": True})
+                except Exception as e:
+                    self._send_json({"error": str(e)}, 500)
+                return
+
+            self.send_response(405)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Method Not Allowed")
+
+        def do_DELETE(self):
+            path = self.path.split("?")[0]
+
+            if path.startswith("/api/remove/"):
+                try:
+                    mid = int(path.split("/")[-1])
+                    conn = get_db()
+                    cursor = conn.execute("SELECT name FROM monitors WHERE id = ?", (mid,))
+                    row = cursor.fetchone()
+                    if not row:
+                        self._send_json({"error": f"未找到监控 #{mid}"}, 404)
+                        return
+                    name = row["name"]
+                    conn.execute("DELETE FROM monitors WHERE id = ?", (mid,))
+                    conn.execute("DELETE FROM price_history WHERE monitor_id = ?", (mid,))
+                    conn.commit()
+                    self._send_json({"ok": True, "name": name})
+                except Exception as e:
+                    self._send_json({"error": str(e)}, 500)
+                return
+
+            self.send_response(405)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Method Not Allowed")
+
+    # 使用 ThreadingHTTPServer 支持并发请求
+    server = HTTPServer((host, port), WebUIHandler)
+    print(f"\n🌐 Web UI 已启动")
+    print(f"📍 地址：http://{host}:{port}")
+    print(f"🛑 按 Ctrl+C 停止\n")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n🛑 Web UI 已停止")
+        server.server_close()
+
+
+async def run_api_server(args):
+    """启动 REST API 服务器"""
+    import threading
+    from api_server import start_api_server
+
+    host = getattr(args, "host", "127.0.0.1")
+    port = getattr(args, "port", 8766)
+    token = getattr(args, "token", None)
+
+    # 在线程中运行 API 服务器
+    server_thread = threading.Thread(target=start_api_server, kwargs={"host": host, "port": port, "token": token}, daemon=True)
+    server_thread.start()
+
+    # 保持主线程运行
+    try:
+        while server_thread.is_alive():
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        print("\n服务器已停止")
+
+
 async def main():
     global SESSION
 
@@ -2321,7 +2993,7 @@ async def main():
 
             # add 命令
             add_parser = parsers.add_parser("add", help="添加监控商品")
-            add_parser.add_argument("--source", required=True, help="平台 1:淘宝 2:京东 3:拼多多 7:抖音 8:快手")
+            add_parser.add_argument("--source", required=True, help="平台 1:淘宝 2:京东 3:拼多多 4:小红书 5:得物 6:唯品会 7:抖音 8:快手 9:美团 10:饿了么")
             add_parser.add_argument("--id", required=True, help="商品 ID")
             add_parser.add_argument("--name", help="商品名称/备注")
             add_parser.add_argument("--target_price", help="目标价格")
@@ -2350,7 +3022,7 @@ async def main():
             # search 命令
             search_parser = parsers.add_parser("search", help="搜索商品并批量添加监控")
             search_parser.add_argument("--keyword", required=True, help="搜索关键词")
-            search_parser.add_argument("--source", required=True, help="平台 1:淘宝 2:京东 3:拼多多 7:抖音 8:快手")
+            search_parser.add_argument("--source", required=True, help="平台 1:淘宝 2:京东 3:拼多多 4:小红书 5:得物 6:唯品会 7:抖音 8:快手 9:美团 10:饿了么")
             search_parser.add_argument("--target_price", help="目标价格")
             search_parser.add_argument("--group", help="分组名称")
             search_parser.add_argument("--limit", type=int, default=10, help="返回结果数量(默认 10)")
@@ -2369,6 +3041,7 @@ async def main():
             config_parser.add_argument("--notify-email-password", help="邮箱密码/授权码")
             config_parser.add_argument("--anomaly-threshold", type=float, help="异常检测阈值 (0.3 表示 30%%)")
             config_parser.add_argument("--anomaly-trend-count", type=int, help="连续趋势检测次数 (默认 3)")
+            config_parser.add_argument("--invite-code", help="买手 API 邀请码(可选)")
             config_parser.set_defaults(func=config_monitor)
 
             # stats 命令
@@ -2463,6 +3136,19 @@ async def main():
                                                help="导出最近 N 天的数据（默认 90）")
             export_history_parser.add_argument("--output", help="指定输出目录（默认 data/exports/）")
             export_history_parser.set_defaults(func=export_history)
+
+            # webui 命令
+            webui_parser = parsers.add_parser("webui", help="启动 Web UI")
+            webui_parser.add_argument("--port", type=int, default=8765, help="端口号（默认 8765）")
+            webui_parser.add_argument("--host", default="127.0.0.1", help="绑定地址（默认 127.0.0.1）")
+            webui_parser.set_defaults(func=start_webui)
+
+            # api-server 命令
+            api_server_parser = parsers.add_parser("api-server", help="启动 REST API 服务器")
+            api_server_parser.add_argument("--port", type=int, default=8766, help="端口号（默认 8766）")
+            api_server_parser.add_argument("--host", default="127.0.0.1", help="绑定地址（默认 127.0.0.1）")
+            api_server_parser.add_argument("--token", default=None, help="API 认证 Token（可选）")
+            api_server_parser.set_defaults(func=run_api_server)
 
             args = parser.parse_args()
             if hasattr(args, "func"):
