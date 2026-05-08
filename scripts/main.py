@@ -872,8 +872,11 @@ async def search_goods(keyword: str, source: int, limit: int = 10) -> List[Dict]
         save_api_cache(cache)
 
         return results
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        print(f"搜索失败（网络错误）：{e}")
+        return []
     except Exception as e:
-        print(f"搜索失败:{e}")
+        print(f"搜索失败（未知错误）：{type(e).__name__}: {e}")
         return []
 
 
@@ -1645,7 +1648,9 @@ async def search_and_monitor(args):
     print(f"  [s] 选择性添加")
     print(f"  [n] 取消")
 
-    choice = input("\n请选择 (a/s/n): ").strip().lower()
+    loop = asyncio.get_event_loop()
+    choice = await loop.run_in_executor(None, lambda: input("\n请选择 (a/s/n): "))
+    choice = choice.strip().lower()
 
     if choice == 'n':
         print("已取消")
@@ -1664,7 +1669,9 @@ async def search_and_monitor(args):
     elif choice == 's':
         print(f"\n请输入要添加的序号(用逗号分隔,如:1,3,5):")
         try:
-            indices = input("> ").strip()
+            loop = asyncio.get_event_loop()
+            indices = await loop.run_in_executor(None, lambda: input("> "))
+            indices = indices.strip()
             if not indices:
                 print("未输入序号,已取消")
                 return
@@ -1683,8 +1690,11 @@ async def search_and_monitor(args):
 
             print(f"\n✅ 已添加 {added_count} 个监控商品!")
 
+        except (ValueError, IndexError) as e:
+            print(f"输入错误：{e}")
+            return
         except Exception as e:
-            print(f"输入错误:{e}")
+            print(f"未知错误：{type(e).__name__}: {e}")
             return
 
     print(f"\n使用 'uv run scripts/main.py list' 查看监控列表")
@@ -2993,8 +3003,9 @@ async def main():
     init_database()
 
     connector = aiohttp.TCPConnector(ssl=SSL_CONTEXT)
+    timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15, sock_connect=5)
     try:
-        async with aiohttp.ClientSession(headers=HEADERS, connector=connector) as SESSION:
+        async with aiohttp.ClientSession(headers=HEADERS, connector=connector, timeout=timeout) as SESSION:
             parser = argparse.ArgumentParser(description="电商价格监控工具(优化版)")
             parsers = parser.add_subparsers()
 
