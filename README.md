@@ -1,4 +1,4 @@
-# 电商价格监控助手 v2.0.0
+﻿# 电商价格监控助手 v2.0.0
 
 > **重大更新** - 修复所有严重 Bug，引入重试机制、原子写入、日志框架  
 > 跟踪商品价格变化，设置降价提醒，自动推送优惠信息  
@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![OpenClaw Skill](https://img.shields.io/badge/OpenClaw-Skill-green.svg)](https://openclaw.ai)
-[![Version](https://img.shields.io/badge/version-2.0.0-red.svg)](https://github.com/Kumagt/price-monitor/releases)
+[![Version](https://img.shields.io/badge/version-2.2.0-red.svg)](https://github.com/Kumagt/price-monitor/releases)
 
 ---
 
