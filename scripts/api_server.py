@@ -1,6 +1,8 @@
 """
-REST API Server for price-monitor v2.3
+REST API Server for price-monitor v2.4
 独立 REST API 服务器，供外部系统调用。
+
+多数据源架构：官方 API 优先 + 买手 fallback。
 
 使用 Python 内置 http.server 模块。
 """
@@ -19,20 +21,26 @@ from urllib.parse import urlparse, parse_qs
 # 共享数据库模块
 from database import init_database, load_config, save_config, DB_FILE, DATA_DIR, CONFIG_FILE
 
+# 多数据源架构
+from datasources import (
+    FallbackDataSource,
+    create_fallback_from_config,
+)
+
 # SSL 配置
 import ssl
 SSL_CONTEXT = ssl.create_default_context()
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
-# ---------- 价格检查 API（需要 aiohttp，延迟导入） ----------
+# ---------- 价格检查 API（多数据源架构） ----------
+
+# 全局数据源实例（延迟初始化）
+_API_DATA_SOURCE: Optional[FallbackDataSource] = None
 
 # ---------- 异步价格查询（独立 session，每次请求新建） ----------
 
-SOURCE_NAMES = {1: "淘宝", 2: "京东", 3: "拼多多", 7: "抖音", 8: "快手"}
-
-MAISHOU_API = "https://appapi.maishou88.com/api/v3/goods/detail"
-MAISHOU_URL_API = "https://msapi.maishou88.com/api/v1/share/getTargetUrl"
+SOURCE_NAMES = {1: "淘宝", 2: "京东", 3: "拼多多", 4: "小红书", 5: "得物", 6: "唯品会", 7: "抖音", 8: "快手", 9: "美团", 10: "饿了么"}
 
 HEADERS = {
     "Accept": "application/json",
@@ -40,80 +48,28 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 AppleWebKit/537 Chrome/143 Safari/537",
 }
 
-RETRY_MAX_ATTEMPTS = 3
-RETRY_BASE_DELAY = 1
-
-
-async def _retry_async(coro_fn, max_retries: int = RETRY_MAX_ATTEMPTS, backoff: float = RETRY_BASE_DELAY):
-    """通用异步重试"""
-    import aiohttp
-    retriable = (
-        aiohttp.ClientConnectionError,
-        aiohttp.ClientTimeout,
-        asyncio.TimeoutError,
-        ConnectionError,
-        TimeoutError,
-        OSError,
-    )
-    for attempt in range(max_retries + 1):
-        try:
-            return await coro_fn()
-        except retriable as e:
-            if attempt < max_retries:
-                delay = backoff * (2 ** attempt)
-                await asyncio.sleep(delay)
-            else:
-                raise
-
 
 async def _fetch_goods_detail(goods_id: str, source: int, invite_code: str = "") -> Optional[Dict]:
-    """获取商品详情"""
+    """获取商品详情（使用多数据源 fallback 架构）。
+
+    通过 FallbackDataSource 按配置优先级依次尝试数据源：
+    - 优先尝试 official（MockOfficialDataSource，待接入）
+    - fallback 到 maishou（真实买手 API）
+    """
+    global _API_DATA_SOURCE
     import aiohttp
+
+    # 延迟初始化数据源
+    if _API_DATA_SOURCE is None:
+        config = load_config()
+        _API_DATA_SOURCE = create_fallback_from_config(config)
 
     connector = aiohttp.TCPConnector(ssl=SSL_CONTEXT)
     async with aiohttp.ClientSession(headers=HEADERS, connector=connector) as session:
-        params = {
-            "goodsId": str(goods_id),
-            "sourceType": str(source),
-            "inviteCode": invite_code,
-            "supplierCode": "",
-            "activityId": "",
-            "isShare": "1",
-            "token": "",
-        }
-
-        async def _request_detail():
-            resp = await session.post(
-                MAISHOU_API,
-                json={**params, "keyword": "", "usageScene": 5},
-                headers=HEADERS,
-            )
-            return await resp.json(encoding="utf-8-sig") or {}
-
-        data = await _retry_async(_request_detail)
-        detail = data.get("data") or {}
-
-        async def _request_url():
-            resp = await session.post(
-                MAISHOU_URL_API,
-                json={**params, "isDirectDetail": 0},
-                headers=HEADERS,
-            )
-            return await resp.json(encoding="utf-8-sig") or {}
-
-        data = await _retry_async(_request_url)
-        info = data.get("data") or {}
-
-        if not info:
-            return None
-
-        return {
-            "title": detail.get("title", ""),
-            "actualPrice": float(detail.get("actualPrice", 0)),
-            "originalPrice": float(detail.get("originalPrice", 0)),
-            "couponPrice": float(detail.get("couponPrice", 0)),
-            "appUrl": info.get("appUrl") or info.get("schemaUrl"),
-        }
+        result = await _API_DATA_SOURCE.get_goods_detail(
+            session, goods_id, source, invite_code=invite_code
+        )
+        return result
 
 
 def check_single_price_api(monitor_id: int) -> Optional[Dict]:
@@ -184,6 +140,7 @@ def check_single_price_api(monitor_id: int) -> Optional[Dict]:
         "original_price": detail.get("originalPrice", current_price),
         "title": detail.get("title", ""),
         "url": detail.get("appUrl", ""),
+        "data_source": detail.get("source", "unknown"),
         "changed": is_change,
     }
 

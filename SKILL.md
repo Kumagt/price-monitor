@@ -2,7 +2,7 @@
 name: price-monitor
 description: 电商价格监控技能（优化版）。智能缓存、错峰请求、只记录变化点，大幅节省 API 配额和存储空间。支持淘宝、京东、拼多多、抖音、快手等平台。
 author: Kumagt
-version: 2.3.0
+version: 2.4.0
 license: MIT
 metadata: {"clawdbot":{"emoji":"💰","requires":{"bins":["python3","uv"]}}}
 ---

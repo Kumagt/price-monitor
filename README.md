@@ -1,12 +1,12 @@
-# 电商价格监控助手 v2.3.0
+# 电商价格监控助手 v2.4.0
 
 > 跟踪商品价格变化，设置降价提醒，自动推送优惠信息  
 > 支持 10 个电商平台 · Web UI · REST API · 价格预测
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![OpenClaw Skill](https://img.shields.io/badge/OpenClaw-Skill-green.svg)](https://openclaw.ai)
-[![Version](https://img.shields.io/badge/version-2.3.0-red.svg)](https://github.com/Kumagt/price-monitor/releases)
+[![ClawHub Skill](https://img.shields.io/badge/ClawHub-Skill-green.svg)](https://clawhub.ai)
+[![Version](https://img.shields.io/badge/version-2.4.0-red.svg)](https://github.com/Kumagt/price-monitor/releases)
 
 ---
 
@@ -54,6 +54,49 @@ uv run scripts/main.py check --id=1   # 检查指定商品
 ```bash
 uv run scripts/main.py webui          # http://127.0.0.1:8765
 ```
+
+---
+
+## 多数据源架构 (v2.4.0+)
+
+价格监控支持**多数据源 fallback** 架构：官方 API 优先 + 买手 fallback。
+
+### 配置示例 (`data/config.json`)
+
+```json
+{
+  "data_sources": {
+    "enabled": ["official", "maishou"]
+  }
+}
+```
+
+| 数据源 | 说明 | 状态 |
+|--------|------|------|
+| `official` | 官方 API（Mock，待接入） | 🚧 占位实现，返回不可用触发 fallback |
+| `maishou` | 买手 API（真实数据源） | ✅ 已接入，需要邀请码 |
+
+### 行为
+
+1. **默认 fallback 模式**：先尝试 `official`，失败后自动切换到 `maishou`
+2. **单一数据源**：可配置仅使用 `maishou`（向后兼容旧配置）
+3. **平台专属官方 API**：内置 `xiaohongshu_official`、`dewu_official`、`vipshop_official`、`meituan_official`、`eleme_official` 占位数据源，包含详细的接入指南
+
+### 配置方式
+
+```bash
+# 默认 fallback 模式（official → maishou）
+uv run scripts/main.py config
+# 编辑 data/config.json，设置 "enabled": ["official", "maishou"]
+
+# 仅使用买手 API（向后兼容）
+# 编辑 data/config.json，设置 "enabled": ["maishou"]
+
+# 仅使用官方 API（测试模式）
+# 编辑 data/config.json，设置 "enabled": ["official"]
+```
+
+> 待真实官方 API 接入后，替换 `datasources.py` 中对应类的请求逻辑即可。
 
 ---
 
@@ -204,11 +247,14 @@ uv run scripts/main.py config
 
 ## 定时任务
 
-使用 OpenClaw cron 设置自动检查：
+使用系统定时任务设置自动检查：
 
 ```bash
-openclaw cron add --name="price-check" --schedule="0 * * * *" \
-  --command="cd price-monitor && uv run scripts/auto-check.py"
+# Linux/macOS - crontab
+0 * * * * cd /path/to/price-monitor && uv run scripts/auto-check.py
+
+# Windows - Task Scheduler
+schtasks /create /tn "price-check" /tr "uv run scripts/auto-check.py" /sc hourly
 ```
 
 ---
@@ -223,10 +269,11 @@ price-monitor/
 ├── SECURITY.md           # 安全政策
 ├── LICENSE               # MIT 许可证
 ├── .env.example          # 环境变量示例
-├── SKILL.md              # OpenClaw 技能描述
+├── SKILL.md              # AI 助手技能描述
 ├── scripts/
 │   ├── main.py           # 主程序
-│   ├── api_server.py     # REST API 服务器
+│   ├── api_server.py     # REST API 服务器（多数据源）
+│   ├── datasources.py    # 多数据源抽象层
 │   ├── database.py       # 共享数据库模块
 │   └── auto-check.py     # 定时检查脚本
 └── data/                 # 运行时数据（不入库）
@@ -238,6 +285,15 @@ price-monitor/
 ---
 
 ## 更新日志
+
+### v2.4.0 (2026-05-10)
+- 新增多数据源架构（官方 API 优先 + 买手 fallback）
+- 新增 `datasources.py` 数据源抽象层（DataSource ABC + FallbackDataSource 组合器）
+- 内置平台专属官方 API 占位数据源（小红书/得物/唯品会/美团/饿了么）
+- `search_goods` 和 `get_goods_detail` 重构为使用 FallbackDataSource
+- REST API 服务器同步升级为多数据源架构
+- 新增 `data_sources` 配置项，支持按优先级排序的数据源列表
+- 向后兼容旧配置（无 data_sources 时默认仅使用 maishou）
 
 ### v2.3.0 (2026-05-08)
 - 新增 Web UI（零依赖内嵌页面）
@@ -304,10 +360,10 @@ MIT License - 详见 [LICENSE](LICENSE) 文件
 
 <div align="center">
 
-**Made with ❤ by Kumagt | Powered by OpenClaw**
+**Made with ❤ by Kumagt**
 
 [⭐ Star](https://github.com/Kumagt/price-monitor) · [🐛 Issues](https://github.com/Kumagt/price-monitor/issues)
 
-**v2.3.0 - Web UI · REST API · 10 平台**
+**v2.4.0 - 多数据源 · Web UI · REST API · 10 平台**
 
 </div>

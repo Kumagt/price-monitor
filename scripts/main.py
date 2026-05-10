@@ -29,6 +29,12 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Callable, TypeVar
 from functools import wraps
 
+# 多数据源架构
+from datasources import (
+    FallbackDataSource,
+    create_fallback_from_config,
+)
+
 # 基础目录
 BASE_DIR = Path(__file__).parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -72,6 +78,7 @@ REQUEST_DELAY_MS = 200   # 请求间隔 200ms,避免触发限流
 
 SESSION: aiohttp.ClientSession | None = None
 DB_CONN: sqlite3.Connection | None = None
+DATA_SOURCE: FallbackDataSource | None = None  # 全局数据源实例
 
 
 def _shutdown():
@@ -383,6 +390,10 @@ def load_config():
         "anomaly_threshold": 0.3,       # 30% 异常波动阈值
         "anomaly_trend_count": 3,       # 连续趋势检测次数
         "invite_code": "",              # 买手 API 邀请码(可选)
+        # 多数据源配置
+        "data_sources": {
+            "enabled": ["official", "maishou"],  # 按优先级排序，默认 fallback 模式
+        },
         # 通知渠道配置
         "notify_channel": "json",  # json/webhook/email/all(逗号分隔)
         "notify_webhook_url": "",
@@ -799,8 +810,8 @@ def record_price_point(monitor_id: int, price: float, original_price: float,
 
 
 async def search_goods(keyword: str, source: int, limit: int = 10) -> List[Dict]:
-    """搜索商品(带缓存)"""
-    global SESSION
+    """搜索商品(带缓存 + 多数据源 fallback)。"""
+    global SESSION, DATA_SOURCE
 
     cache_key = f"search:{source}:{keyword}:{limit}"
     cache = load_api_cache()
@@ -809,67 +820,25 @@ async def search_goods(keyword: str, source: int, limit: int = 10) -> List[Dict]
         print(f"⚡ 使用缓存:搜索 \"{keyword}\"")
         return cache[cache_key]["data"]
 
-    # 获取邀请码：环境变量 > config.json > 空字符串
+    # 初始化数据源
     config = load_config()
+    if DATA_SOURCE is None:
+        DATA_SOURCE = create_fallback_from_config(config)
+
     invite_code = INVITE_CODE or config.get("invite_code", "")
 
+    if not invite_code and "maishou" in (config.get("data_sources", {}).get("enabled", ["maishou"])):
+        print("⚠️ 未设置邀请码，买手 API 可能失败。请通过以下方式之一设置：")
+        print("   1. 环境变量: MAISHOU_INVITE_CODE=你的邀请码")
+        print("   2. 配置文件: uv run scripts/main.py config --invite-code=你的邀请码")
+
     try:
-        if not invite_code:
-            print("⚠️ 未设置邀请码，API 调用可能失败。请通过以下方式之一设置：")
-            print("   1. 环境变量: MAISHOU_INVITE_CODE=你的邀请码")
-            print("   2. 配置文件: uv run scripts/main.py config --invite-code=你的邀请码")
+        results = await DATA_SOURCE.search_goods(
+            SESSION, keyword, source, limit, invite_code=invite_code
+        )
 
-        async def _request():
-            resp = await SESSION.post(
-                "https://appapi.maishou88.com/api/v3/goods/list",
-                json={
-                    "keyword": keyword,
-                    "sourceType": str(source),
-                    "inviteCode": invite_code,
-                    "supplierCode": "",
-                    "activityId": "",
-                    "usageScene": 5,
-                    "page": 1,
-                    "pageSize": limit,
-                },
-                headers=HEADERS,
-            )
-            return await resp.json(encoding="utf-8-sig") or {}
-
-        data = await retry_async(_request)
-
-        result = data.get("data") or data.get("result") or {}
-        goods_list = result.get("goodsList") or result.get("list") or result.get("items") or []
-
-        if isinstance(result, list):
-            goods_list = result
-
-        if not goods_list:
+        if not results:
             return []
-
-        results = []
-        for goods in goods_list:
-            try:
-                goods_id = goods.get("goodsId") or goods.get("id") or goods.get("goods_id")
-                if not goods_id:
-                    continue
-
-                actual_price = float(goods.get("actualPrice") or goods.get("price") or goods.get("actual_price") or 0)
-                original_price = float(goods.get("originalPrice") or goods.get("marketPrice") or goods.get("original_price") or actual_price)
-                title = goods.get("title") or goods.get("goodsName") or goods.get("name") or "未知商品"
-                app_url = goods.get("appUrl") or goods.get("clickUrl") or goods.get("url") or ""
-
-                results.append({
-                    "goods_id": goods_id,
-                    "title": title,
-                    "actualPrice": actual_price,
-                    "originalPrice": original_price,
-                    "appUrl": app_url,
-                    "couponPrice": float(goods.get("couponPrice") or goods.get("coupon_price") or 0),
-                })
-            except Exception as e:
-                print(f"解析商品数据失败:{e}")
-                continue
 
         # 缓存结果
         cache[cache_key] = {
@@ -879,23 +848,23 @@ async def search_goods(keyword: str, source: int, limit: int = 10) -> List[Dict]
         save_api_cache(cache)
 
         return results
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        print(f"搜索失败（网络错误）：{e}")
-        return []
     except Exception as e:
-        print(f"搜索失败（未知错误）：{type(e).__name__}: {e}")
+        print(f"搜索失败：{type(e).__name__}: {e}")
         return []
 
 
 async def get_goods_detail(goods_id: str, source: int) -> Optional[Dict]:
-    """获取商品详情(带缓存和限流)"""
-    global SESSION
+    """获取商品详情(带缓存 + 多数据源 fallback + 限流)。"""
+    global SESSION, DATA_SOURCE
 
     cache_key = get_cache_key(source, goods_id)
     cache = load_api_cache()
     config = load_config()
 
-    # 获取邀请码：环境变量 > config.json > 空字符串
+    # 初始化数据源
+    if DATA_SOURCE is None:
+        DATA_SOURCE = create_fallback_from_config(config)
+
     invite_code = INVITE_CODE or config.get("invite_code", "")
 
     # 检查缓存
@@ -903,64 +872,21 @@ async def get_goods_detail(goods_id: str, source: int) -> Optional[Dict]:
         print(f"⚡ 使用缓存:商品 {goods_id}")
         return cache[cache_key]["data"]
 
-    if not invite_code:
-        print("⚠️ 未设置邀请码，API 调用可能失败。请通过以下方式之一设置：")
+    if not invite_code and "maishou" in (config.get("data_sources", {}).get("enabled", ["maishou"])):
+        print("⚠️ 未设置邀请码，买手 API 可能失败。请通过以下方式之一设置：")
         print("   1. 环境变量: MAISHOU_INVITE_CODE=你的邀请码")
         print("   2. 配置文件: uv run scripts/main.py config --invite-code=你的邀请码")
-
-    params = {
-        "goodsId": str(goods_id),
-        "sourceType": str(source),
-        "inviteCode": invite_code,
-        "supplierCode": "",
-        "activityId": "",
-        "isShare": "1",
-        "token": "",
-    }
 
     try:
         # 延迟请求,避免限流
         await asyncio.sleep(config.get("request_delay_ms", REQUEST_DELAY_MS) / 1000)
 
-        async def _request_detail():
-            resp = await SESSION.post(
-                "https://appapi.maishou88.com/api/v3/goods/detail",
-                json={
-                    **params,
-                    "keyword": "",
-                    "usageScene": 5,
-                },
-                headers=HEADERS,
-            )
-            return await resp.json(encoding="utf-8-sig") or {}
+        result = await DATA_SOURCE.get_goods_detail(
+            SESSION, goods_id, source, invite_code=invite_code
+        )
 
-        data = await retry_async(_request_detail)
-        detail = data.get("data") or {}
-
-        async def _request_url():
-            resp = await SESSION.post(
-                "https://msapi.maishou88.com/api/v1/share/getTargetUrl",
-                json={
-                    **params,
-                    "isDirectDetail": 0,
-                },
-                headers=HEADERS,
-            )
-            return await resp.json(encoding="utf-8-sig") or {}
-
-        data = await retry_async(_request_url)
-        info = data.get("data") or {}
-
-        if not info:
+        if result is None:
             return None
-
-        result = {
-            "title": detail.get("title", ""),
-            "actualPrice": float(detail.get("actualPrice", 0)),
-            "originalPrice": float(detail.get("originalPrice", 0)),
-            "couponPrice": float(detail.get("couponPrice", 0)),
-            "appUrl": info.get("appUrl") or info.get("schemaUrl"),
-        }
 
         # 缓存结果
         cache[cache_key] = {
@@ -1011,67 +937,324 @@ def register_platform(adapter_class):
 
 @register_platform
 class XiaohongshuAdapter(PlatformAdapter):
-    """小红书平台适配器（待接入）"""
+    """小红书平台适配器
+
+    当前通过买手 API (maishou88) sourceType=4 获取数据。
+    如需要直接接入小红书开放平台，参考以下指南：
+
+    【直接接入指南】
+    1. 注册小红书开放平台：https://open.xiaohongshu.com
+    2. 申请「电商」相关 API 权限
+    3. 主要 API 端点：
+       - 商品详情：GET /api/v1/goods/detail?goodsId={id}
+       - 商品搜索：GET /api/v1/goods/search?keyword={kw}
+    4. 需要 OAuth 2.0 认证，获取 access_token
+    5. 注意：小红书 API 主要面向入驻商家，普通开发者权限有限
+
+    【替代方案】
+    - 通过买手 API 聚合获取（当前方案，推荐）
+    - 网页解析（需要处理反爬，不稳定，不推荐生产环境）
+    """
     platform_id = 4
     platform_name = "小红书"
 
     async def get_price(self, session, goods_id):
-        return {"status": "pending", "message": f"{self.platform_name} API 待接入", "goods_id": goods_id}
+        """通过买手 API 获取小红书商品价格"""
+        try:
+            detail = await get_goods_detail(goods_id, self.platform_id)
+            if detail:
+                return {
+                    "status": "ok",
+                    "goods_id": goods_id,
+                    "title": detail.get("title", ""),
+                    "actualPrice": detail["actualPrice"],
+                    "originalPrice": detail["originalPrice"],
+                    "couponPrice": detail.get("couponPrice", 0),
+                    "appUrl": detail.get("appUrl", ""),
+                }
+            return {
+                "status": "error",
+                "message": f"{self.platform_name} 商品 {goods_id} 未找到",
+                "goods_id": goods_id,
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"{self.platform_name} 价格查询失败: {e}",
+                "goods_id": goods_id,
+            }
 
     async def search_goods(self, session, keyword, **kwargs):
-        return [{"status": "pending", "message": f"{self.platform_name} 搜索待接入", "keyword": keyword}]
+        """通过买手 API 搜索小红书商品"""
+        limit = kwargs.get("limit", 10)
+        try:
+            results = await search_goods(keyword, self.platform_id, limit)
+            if results:
+                return [{"status": "ok", **item} for item in results]
+            return [{"status": "no_results", "keyword": keyword, "message": f"{self.platform_name} 未找到相关商品"}]
+        except Exception as e:
+            return [{"status": "error", "keyword": keyword, "message": f"{self.platform_name} 搜索失败: {e}"}]
 
 
 @register_platform
 class DewuAdapter(PlatformAdapter):
-    """得物平台适配器（待接入）"""
+    """得物平台适配器
+
+    当前通过买手 API (maishou88) sourceType=5 获取数据。
+    如需要直接接入得物开放平台，参考以下指南：
+
+    【直接接入指南】
+    1. 注册得物开放平台：https://open.dewu.com
+    2. 申请商品相关 API 权限
+    3. 得物 API 主要面向品牌商家/供应链合作方
+    4. 需要企业账号入驻，个人开发者权限受限
+    5. 主要 API：
+       - 商品信息：POST /open-api/goods/detail
+       - 价格查询：POST /open-api/goods/price
+    6. 使用 AppKey + AppSecret 签名认证
+
+    【替代方案】
+    - 通过买手 API 聚合获取（当前方案，推荐）
+    - 第三方数据服务（如慢慢买、比价网等）
+    - 网页解析（得物有较强的反爬机制，不推荐）
+    """
     platform_id = 5
     platform_name = "得物"
 
     async def get_price(self, session, goods_id):
-        return {"status": "pending", "message": f"{self.platform_name} API 待接入", "goods_id": goods_id}
+        """通过买手 API 获取得物商品价格"""
+        try:
+            detail = await get_goods_detail(goods_id, self.platform_id)
+            if detail:
+                return {
+                    "status": "ok",
+                    "goods_id": goods_id,
+                    "title": detail.get("title", ""),
+                    "actualPrice": detail["actualPrice"],
+                    "originalPrice": detail["originalPrice"],
+                    "couponPrice": detail.get("couponPrice", 0),
+                    "appUrl": detail.get("appUrl", ""),
+                }
+            return {
+                "status": "error",
+                "message": f"{self.platform_name} 商品 {goods_id} 未找到",
+                "goods_id": goods_id,
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"{self.platform_name} 价格查询失败: {e}",
+                "goods_id": goods_id,
+            }
 
     async def search_goods(self, session, keyword, **kwargs):
-        return [{"status": "pending", "message": f"{self.platform_name} 搜索待接入", "keyword": keyword}]
+        """通过买手 API 搜索得物商品"""
+        limit = kwargs.get("limit", 10)
+        try:
+            results = await search_goods(keyword, self.platform_id, limit)
+            if results:
+                return [{"status": "ok", **item} for item in results]
+            return [{"status": "no_results", "keyword": keyword, "message": f"{self.platform_name} 未找到相关商品"}]
+        except Exception as e:
+            return [{"status": "error", "keyword": keyword, "message": f"{self.platform_name} 搜索失败: {e}"}]
 
 
 @register_platform
 class VipshopAdapter(PlatformAdapter):
-    """唯品会平台适配器（待接入）"""
+    """唯品会平台适配器
+
+    当前通过买手 API (maishou88) sourceType=6 获取数据。
+    如需要直接接入唯品会开放平台，参考以下指南：
+
+    【直接接入指南】
+    1. 注册唯品会开放平台：https://open.vip.com
+    2. 唯品会 API 端点示例：https://open.vip.com/api?service={service_name}
+    3. 需要 AppKey + AppSecret，使用签名认证
+    4. 主要 API 服务：
+       - goods.detail.get — 商品详情
+       - goods.price.get — 商品价格
+       - goods.search — 商品搜索
+    5. 请求参数需包含：app_key、timestamp、sign、format=json
+    6. 唯品会对第三方开发者审核严格，需提交企业资质
+
+    【签名示例】
+    sign = MD5(app_key + service + timestamp + app_secret)
+
+    【替代方案】
+    - 通过买手 API 聚合获取（当前方案，推荐）
+    - 唯品会 CPS 联盟（推广佣金模式）：https://union.vip.com
+    """
     platform_id = 6
     platform_name = "唯品会"
 
     async def get_price(self, session, goods_id):
-        return {"status": "pending", "message": f"{self.platform_name} API 待接入", "goods_id": goods_id}
+        """通过买手 API 获取唯品会商品价格"""
+        try:
+            detail = await get_goods_detail(goods_id, self.platform_id)
+            if detail:
+                return {
+                    "status": "ok",
+                    "goods_id": goods_id,
+                    "title": detail.get("title", ""),
+                    "actualPrice": detail["actualPrice"],
+                    "originalPrice": detail["originalPrice"],
+                    "couponPrice": detail.get("couponPrice", 0),
+                    "appUrl": detail.get("appUrl", ""),
+                }
+            return {
+                "status": "error",
+                "message": f"{self.platform_name} 商品 {goods_id} 未找到",
+                "goods_id": goods_id,
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"{self.platform_name} 价格查询失败: {e}",
+                "goods_id": goods_id,
+            }
 
     async def search_goods(self, session, keyword, **kwargs):
-        return [{"status": "pending", "message": f"{self.platform_name} 搜索待接入", "keyword": keyword}]
+        """通过买手 API 搜索唯品会商品"""
+        limit = kwargs.get("limit", 10)
+        try:
+            results = await search_goods(keyword, self.platform_id, limit)
+            if results:
+                return [{"status": "ok", **item} for item in results]
+            return [{"status": "no_results", "keyword": keyword, "message": f"{self.platform_name} 未找到相关商品"}]
+        except Exception as e:
+            return [{"status": "error", "keyword": keyword, "message": f"{self.platform_name} 搜索失败: {e}"}]
 
 
 @register_platform
 class MeituanAdapter(PlatformAdapter):
-    """美团平台适配器（待接入）"""
+    """美团平台适配器
+
+    当前通过买手 API (maishou88) sourceType=9 获取数据。
+    如需要直接接入美团开放平台，参考以下指南：
+
+    【直接接入指南】
+    1. 注册美团开放平台：https://developer.meituan.com
+    2. 美团 API 主要面向本地生活/外卖服务
+    3. 商品/价格相关 API 有限，主要为：
+       - 门店信息查询
+       - 商品/团购信息（需特定权限）
+    4. 需要企业资质入驻，个人开发者权限极少
+    5. 认证方式：OAuth 2.0 + AppKey
+
+    【注意事项】
+    - 美团核心商品价格 API 不对普通开发者开放
+    - 团购/到店业务可通过美团联盟获取推广链接
+    - 美团联盟：https://union.meituan.com
+
+    【替代方案】
+    - 通过买手 API 聚合获取（当前方案，推荐）
+    - 美团联盟 CPS 模式
+    """
     platform_id = 9
     platform_name = "美团"
 
     async def get_price(self, session, goods_id):
-        return {"status": "pending", "message": f"{self.platform_name} API 待接入", "goods_id": goods_id}
+        """通过买手 API 获取美团商品价格"""
+        try:
+            detail = await get_goods_detail(goods_id, self.platform_id)
+            if detail:
+                return {
+                    "status": "ok",
+                    "goods_id": goods_id,
+                    "title": detail.get("title", ""),
+                    "actualPrice": detail["actualPrice"],
+                    "originalPrice": detail["originalPrice"],
+                    "couponPrice": detail.get("couponPrice", 0),
+                    "appUrl": detail.get("appUrl", ""),
+                }
+            return {
+                "status": "error",
+                "message": f"{self.platform_name} 商品 {goods_id} 未找到",
+                "goods_id": goods_id,
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"{self.platform_name} 价格查询失败: {e}",
+                "goods_id": goods_id,
+            }
 
     async def search_goods(self, session, keyword, **kwargs):
-        return [{"status": "pending", "message": f"{self.platform_name} 搜索待接入", "keyword": keyword}]
+        """通过买手 API 搜索美团商品"""
+        limit = kwargs.get("limit", 10)
+        try:
+            results = await search_goods(keyword, self.platform_id, limit)
+            if results:
+                return [{"status": "ok", **item} for item in results]
+            return [{"status": "no_results", "keyword": keyword, "message": f"{self.platform_name} 未找到相关商品"}]
+        except Exception as e:
+            return [{"status": "error", "keyword": keyword, "message": f"{self.platform_name} 搜索失败: {e}"}]
 
 
 @register_platform
 class ElemeAdapter(PlatformAdapter):
-    """饿了么平台适配器（待接入）"""
+    """饿了么平台适配器
+
+    当前通过买手 API (maishou88) sourceType=10 获取数据。
+    如需要直接接入饿了么开放平台，参考以下指南：
+
+    【直接接入指南】
+    1. 注册阿里开放平台/饿了么开发者中心：https://open.alipay.com / https://open.ele.me
+    2. 饿了么 API 属于阿里本地生活体系
+    3. 主要 API（需入驻）：
+       - 门店商品查询：eleme.product.get
+       - 价格查询：通过门店 + 商品 ID 获取
+    4. 认证方式：淘宝开放平台 OAuth（TOP SDK）
+    5. 需要企业资质，个人开发者基本无法申请
+
+    【注意事项】
+    - 饿了么 API 主要面向 ISV/商家/服务商
+    - 价格数据通常需要门店授权才能访问
+    - 无公开的面向消费者的价格查询 API
+
+    【替代方案】
+    - 通过买手 API 聚合获取（当前方案，推荐）
+    - 淘宝客/阿里妈妈联盟体系
+    """
     platform_id = 10
     platform_name = "饿了么"
 
     async def get_price(self, session, goods_id):
-        return {"status": "pending", "message": f"{self.platform_name} API 待接入", "goods_id": goods_id}
+        """通过买手 API 获取饿了么商品价格"""
+        try:
+            detail = await get_goods_detail(goods_id, self.platform_id)
+            if detail:
+                return {
+                    "status": "ok",
+                    "goods_id": goods_id,
+                    "title": detail.get("title", ""),
+                    "actualPrice": detail["actualPrice"],
+                    "originalPrice": detail["originalPrice"],
+                    "couponPrice": detail.get("couponPrice", 0),
+                    "appUrl": detail.get("appUrl", ""),
+                }
+            return {
+                "status": "error",
+                "message": f"{self.platform_name} 商品 {goods_id} 未找到",
+                "goods_id": goods_id,
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"{self.platform_name} 价格查询失败: {e}",
+                "goods_id": goods_id,
+            }
 
     async def search_goods(self, session, keyword, **kwargs):
-        return [{"status": "pending", "message": f"{self.platform_name} 搜索待接入", "keyword": keyword}]
+        """通过买手 API 搜索饿了么商品"""
+        limit = kwargs.get("limit", 10)
+        try:
+            results = await search_goods(keyword, self.platform_id, limit)
+            if results:
+                return [{"status": "ok", **item} for item in results]
+            return [{"status": "no_results", "keyword": keyword, "message": f"{self.platform_name} 未找到相关商品"}]
+        except Exception as e:
+            return [{"status": "error", "keyword": keyword, "message": f"{self.platform_name} 搜索失败: {e}"}]
 
 
 async def compare_goods(args):
@@ -2552,8 +2735,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <option value="1">淘宝</option>
 <option value="2">京东</option>
 <option value="3">拼多多</option>
+<option value="4">小红书</option>
+<option value="5">得物</option>
+<option value="6">唯品会</option>
 <option value="7">抖音</option>
 <option value="8">快手</option>
+<option value="9">美团</option>
+<option value="10">饿了么</option>
 </select>
 <select id="filterGroup" onchange="applyFilters()">
 <option value="">全部分组</option>
@@ -2573,8 +2761,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <option value="1">淘宝</option>
 <option value="2">京东</option>
 <option value="3">拼多多</option>
+<option value="4">小红书</option>
+<option value="5">得物</option>
+<option value="6">唯品会</option>
 <option value="7">抖音</option>
 <option value="8">快手</option>
+<option value="9">美团</option>
+<option value="10">饿了么</option>
 </select>
 </div>
 <div class="form-group">
@@ -2619,7 +2812,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="toast" id="toast"></div>
 
 <script>
-const PLATFORM_NAMES={1:'淘宝',2:'京东',3:'拼多多',7:'抖音',8:'快手'};
+const PLATFORM_NAMES={1:'淘宝',2:'京东',3:'拼多多',4:'小红书',5:'得物',6:'唯品会',7:'抖音',8:'快手',9:'美团',10:'饿了么'};
 let allMonitors=[];
 let priceChart=null;
 
